@@ -60,6 +60,12 @@ IPV6_ULA_PREFIX="fd00:ab::"
 B_ETH1_IPV6_ULA=""   # 本端 eth1 ULA 地址
 A_ETH1_IPV6_ULA=""   # 内地端 eth1 ULA 地址
 
+# IPv6 出口检测
+B_WAN_IPV6=""        # 本端 WAN 口的 IPv6 地址
+HAS_WAN_IPV6=0       # 本端 WAN 是否有 IPv6
+USE_SIT_TUNNEL=0     # 是否使用 SIT 隧道（SD-WAN 无原生 IPv6 时）
+SIT_TUNNEL_NAME="sit-ab"
+
 LOCAL_HOSTNAME=""
 LOCAL_NIC_INFO=""
 B_SD_WAN_IF=""
@@ -336,6 +342,18 @@ gather_local_info() {
     die "无法读取出口网卡($B_WAN_IF)的IPv4地址"
   fi
   B_WAN_IP=${wan_cidr%/*}
+
+  # 检测本端 WAN 口是否有全局 IPv6 地址（排除 link-local fe80::）
+  local wan_ipv6_cidr
+  wan_ipv6_cidr=$(ip -o -6 addr show dev "$B_WAN_IF" scope global | awk '{print $4}' | head -n1 || true)
+  if [[ -n $wan_ipv6_cidr ]]; then
+    B_WAN_IPV6=${wan_ipv6_cidr%/*}
+    HAS_WAN_IPV6=1
+    info "检测到本端WAN口($B_WAN_IF)有全局IPv6地址: $B_WAN_IPV6"
+  else
+    HAS_WAN_IPV6=0
+    info "本端WAN口($B_WAN_IF)无全局IPv6地址，IPv6出口功能将不可用"
+  fi
 }
 
 gather_remote_info() {
@@ -415,6 +433,18 @@ gather_remote_info() {
   local a_last_octet
   a_last_octet=$(awk -F. '{print $4}' <<<"$A_IP")
   A_ETH1_IPV6_ULA="${IPV6_ULA_PREFIX}${a_last_octet}"
+
+  # 检测 SD-WAN 是否有原生 IPv6 连通性
+  # 判断条件：本端 SD-WAN 接口是否有全局 IPv6 地址
+  local sdwan_ipv6_cidr
+  sdwan_ipv6_cidr=$(ip -o -6 addr show dev "$B_SD_WAN_IF" scope global 2>/dev/null | awk '{print $4}' | head -n1 || true)
+  if [[ -n $sdwan_ipv6_cidr ]]; then
+    USE_SIT_TUNNEL=0
+    info "SD-WAN接口($B_SD_WAN_IF)有全局IPv6地址，使用原生IPv6+NAT66模式"
+  else
+    USE_SIT_TUNNEL=1
+    info "SD-WAN接口($B_SD_WAN_IF)无全局IPv6地址，将使用SIT隧道模式"
+  fi
 }
 
 enable_ip_forward() {
@@ -462,6 +492,61 @@ deploy_nft() {
   local elements
   elements=$(build_nft_elements)
   mkdir -p "$(dirname "$NFT_SCRIPT_PATH")"
+
+  # 根据是否有 WAN IPv6 和是否使用 SIT 隧道生成不同的脚本
+  if [[ $HAS_WAN_IPV6 -eq 1 ]]; then
+    if [[ $USE_SIT_TUNNEL -eq 1 ]]; then
+      # SIT 隧道模式：SD-WAN 无原生 IPv6，通过 SIT 隧道封装
+      info "生成 SIT 隧道 + IPv6 NAT66 配置..."
+cat >"$NFT_SCRIPT_PATH" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+set +o braceexpand
+PATH=/sbin:/usr/sbin:/bin:/usr/bin
+
+# ========== SIT 隧道配置 ==========
+# 删除已有的 SIT 隧道（如果存在）
+ip tunnel del $SIT_TUNNEL_NAME 2>/dev/null || true
+
+# 创建 SIT 隧道（IPv6 over IPv4）
+ip tunnel add $SIT_TUNNEL_NAME mode sit remote $A_IP local $B_SD_WAN_IP ttl 255
+ip link set $SIT_TUNNEL_NAME up
+
+# 配置隧道的 IPv6 ULA 地址
+ip -6 addr add ${B_ETH1_IPV6_ULA}/64 dev $SIT_TUNNEL_NAME 2>/dev/null || true
+
+# ========== IPv4 SNAT 规则 ==========
+nft delete table ip ab_snat >/dev/null 2>&1 || true
+nft -f - <<'NFT'
+table ip ab_snat {
+  set a_sources {
+    type ipv4_addr
+    elements = { $elements }
+  }
+
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+    iifname "$B_SD_WAN_IF"
+    oifname "$B_WAN_IF"
+    ip saddr @a_sources masquerade
+  }
+}
+NFT
+
+# ========== IPv6 NAT66 规则（通过 SIT 隧道） ==========
+nft delete table ip6 ab_snat6 >/dev/null 2>&1 || true
+nft -f - <<'NFT6'
+table ip6 ab_snat6 {
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+    iifname "$SIT_TUNNEL_NAME" oifname "$B_WAN_IF" masquerade
+  }
+}
+NFT6
+EOF
+    else
+      # 原生 IPv6 模式：SD-WAN 有原生 IPv6
+      info "生成原生 IPv6 + NAT66 配置..."
 cat >"$NFT_SCRIPT_PATH" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
@@ -502,6 +587,36 @@ table ip6 ab_snat6 {
 }
 NFT6
 EOF
+    fi
+  else
+    # 无 WAN IPv6，仅配置 IPv4 SNAT
+    info "本端无 IPv6 出口，仅配置 IPv4 SNAT..."
+cat >"$NFT_SCRIPT_PATH" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+set +o braceexpand
+PATH=/sbin:/usr/sbin:/bin:/usr/bin
+
+# IPv4 SNAT 规则
+nft delete table ip ab_snat >/dev/null 2>&1 || true
+nft -f - <<'NFT'
+table ip ab_snat {
+  set a_sources {
+    type ipv4_addr
+    elements = { $elements }
+  }
+
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+    iifname "$B_SD_WAN_IF"
+    oifname "$B_WAN_IF"
+    ip saddr @a_sources masquerade
+  }
+}
+NFT
+EOF
+  fi
+
   chmod 700 "$NFT_SCRIPT_PATH"
 
   cat >"$NFT_SERVICE_PATH" <<EOF
@@ -579,9 +694,14 @@ ETH1_GW="$A_ETH1_GW"
 ETH1_SRC="$A_ETH1_IP"
 ETH1_HAS_IPV4="$A_ETH1_HAS_IPV4"
 
-# IPv6 ULA 配置
+# IPv6 配置
 IPV6_LOCAL_ULA="${A_ETH1_IPV6_ULA}/64"
 IPV6_GW_ULA="$B_ETH1_IPV6_ULA"
+HAS_WAN_IPV6="$HAS_WAN_IPV6"
+USE_SIT_TUNNEL="$USE_SIT_TUNNEL"
+SIT_TUNNEL_NAME="$SIT_TUNNEL_NAME"
+SIT_REMOTE_IP="$B_SD_WAN_IP"
+SIT_LOCAL_IP="$A_IP"
 
 ensure_table_entry() {
   local table_id=\$1
@@ -729,26 +849,57 @@ setup_sdwan_policy() {
 
 setup_ipv6_route() {
   # 配置 IPv6 ULA 地址和默认路由，让 IPv6 流量通过香港端出口
+  if [[ "\$HAS_WAN_IPV6" != "1" ]]; then
+    echo "香港端无 IPv6 出口，跳过 IPv6 路由配置"
+    return 0
+  fi
+
   if [[ -z "\$IPV6_LOCAL_ULA" || -z "\$IPV6_GW_ULA" ]]; then
     echo "IPv6 ULA 配置为空，跳过 IPv6 路由配置"
     return 0
   fi
-  if ! dev_exists "\$ETH1_DEV"; then
-    echo "eth1 接口不存在，跳过 IPv6 路由配置"
-    return 0
-  fi
 
-  echo "配置 IPv6 ULA 地址: \$IPV6_LOCAL_ULA on \$ETH1_DEV"
-  # 添加 ULA 地址（如果不存在）
-  if ! ip -6 addr show dev "\$ETH1_DEV" 2>/dev/null | grep -q "\${IPV6_LOCAL_ULA%/*}/"; then
-    ip -6 addr add "\$IPV6_LOCAL_ULA" dev "\$ETH1_DEV" 2>/dev/null || true
-  fi
+  if [[ "\$USE_SIT_TUNNEL" == "1" ]]; then
+    # ========== SIT 隧道模式 ==========
+    echo "使用 SIT 隧道模式配置 IPv6..."
+    
+    # 删除已有的 SIT 隧道（如果存在）
+    ip tunnel del "\$SIT_TUNNEL_NAME" 2>/dev/null || true
+    
+    # 创建 SIT 隧道（IPv6 over IPv4）
+    echo "创建 SIT 隧道: \$SIT_TUNNEL_NAME (local=\$SIT_LOCAL_IP, remote=\$SIT_REMOTE_IP)"
+    ip tunnel add "\$SIT_TUNNEL_NAME" mode sit remote "\$SIT_REMOTE_IP" local "\$SIT_LOCAL_IP" ttl 255
+    ip link set "\$SIT_TUNNEL_NAME" up
+    
+    # 配置隧道的 IPv6 ULA 地址
+    echo "配置 SIT 隧道 IPv6 地址: \$IPV6_LOCAL_ULA"
+    ip -6 addr add "\$IPV6_LOCAL_ULA" dev "\$SIT_TUNNEL_NAME" 2>/dev/null || true
+    
+    # 配置 IPv6 默认路由通过隧道
+    echo "配置 IPv6 默认路由: via \$IPV6_GW_ULA dev \$SIT_TUNNEL_NAME"
+    ip -6 route del default 2>/dev/null || true
+    ip -6 route replace default via "\$IPV6_GW_ULA" dev "\$SIT_TUNNEL_NAME" 2>/dev/null || true
+  else
+    # ========== 原生 IPv6 模式 ==========
+    echo "使用原生 IPv6 模式配置..."
+    
+    if ! dev_exists "\$ETH1_DEV"; then
+      echo "eth1 接口不存在，跳过 IPv6 路由配置"
+      return 0
+    fi
 
-  echo "配置 IPv6 默认路由: via \$IPV6_GW_ULA dev \$ETH1_DEV"
-  # 删除已有的 ULA 网段默认路由（避免冲突）
-  ip -6 route del default via "\$IPV6_GW_ULA" dev "\$ETH1_DEV" 2>/dev/null || true
-  # 添加 IPv6 默认路由
-  ip -6 route replace default via "\$IPV6_GW_ULA" dev "\$ETH1_DEV" 2>/dev/null || true
+    echo "配置 IPv6 ULA 地址: \$IPV6_LOCAL_ULA on \$ETH1_DEV"
+    # 添加 ULA 地址（如果不存在）
+    if ! ip -6 addr show dev "\$ETH1_DEV" 2>/dev/null | grep -q "\${IPV6_LOCAL_ULA%/*}/"; then
+      ip -6 addr add "\$IPV6_LOCAL_ULA" dev "\$ETH1_DEV" 2>/dev/null || true
+    fi
+
+    echo "配置 IPv6 默认路由: via \$IPV6_GW_ULA dev \$ETH1_DEV"
+    # 删除已有的默认路由（避免冲突）
+    ip -6 route del default via "\$IPV6_GW_ULA" dev "\$ETH1_DEV" 2>/dev/null || true
+    # 添加 IPv6 默认路由
+    ip -6 route replace default via "\$IPV6_GW_ULA" dev "\$ETH1_DEV" 2>/dev/null || true
+  fi
 }
 
 rollback_all() {
@@ -761,8 +912,11 @@ rollback_all() {
   done
   ip rule del priority "\$ETH1_RULE_PRIORITY" 2>/dev/null || true
   ip rule del priority "\$SSH_WHITELIST_PRIORITY" 2>/dev/null || true
-  # 回滚 IPv6 路由
-  ip -6 route del default via "\$IPV6_GW_ULA" dev "\$ETH1_DEV" 2>/dev/null || true
+  # 回滚 IPv6 路由和 SIT 隧道
+  ip -6 route del default 2>/dev/null || true
+  if [[ "\$USE_SIT_TUNNEL" == "1" ]]; then
+    ip tunnel del "\$SIT_TUNNEL_NAME" 2>/dev/null || true
+  fi
   echo "回滚完成"
 }
 
@@ -1012,14 +1166,32 @@ print_summary() {
   info "=== 中国内地机器网卡信息 ==="
   printf '%s\n' "$A_NIC_INFO"
 
+  # IPv6 模式描述
+  local ipv6_mode_desc
+  local ipv6_tunnel_info=""
+  if [[ $HAS_WAN_IPV6 -eq 1 ]]; then
+    if [[ $USE_SIT_TUNNEL -eq 1 ]]; then
+      ipv6_mode_desc="SIT隧道 + NAT66"
+      ipv6_tunnel_info="
+  SIT隧道名称: $SIT_TUNNEL_NAME
+  SIT隧道: $B_SD_WAN_IP <-> $A_IP (IPv6 over IPv4)"
+    else
+      ipv6_mode_desc="原生IPv6 + NAT66"
+    fi
+  else
+    ipv6_mode_desc="无IPv6出口"
+  fi
+
   cat <<EOF
 
 -------------------------
 本端机器 ($LOCAL_HOSTNAME):
   SD-WAN接口: $B_SD_WAN_IF ($B_SD_WAN_IP)
-  SD-WAN IPv6 ULA: ${B_ETH1_IPV6_ULA}/64
   WAN接口: $B_WAN_IF ($B_WAN_IP via $B_WAN_GW)
-  SNAT脚本: $NFT_SCRIPT_PATH (IPv4 + IPv6 NAT66)
+  WAN IPv6: ${B_WAN_IPV6:-无}
+  IPv6模式: $ipv6_mode_desc${ipv6_tunnel_info}
+  IPv6 ULA: ${B_ETH1_IPV6_ULA}/64
+  SNAT脚本: $NFT_SCRIPT_PATH
   SNAT服务: $(basename "$NFT_SERVICE_PATH")
   sysctl文件: $SYSCTL_FILE (含IPv6转发)
 
@@ -1028,7 +1200,7 @@ print_summary() {
   中国内地接入接口: $A_SD_WAN_IF ($A_IP)
   eth0源IP: $eth0_ip_display | eth0网关: $eth0_gw_display $eth0_note
   eth1源IP: $eth1_ip_display | eth1网关: $eth1_gw_display $eth1_note
-  eth1 IPv6 ULA: ${A_ETH1_IPV6_ULA}/64 (默认路由指向 $B_ETH1_IPV6_ULA)
+  IPv6 ULA: ${A_ETH1_IPV6_ULA}/64 (默认路由指向 $B_ETH1_IPV6_ULA)
   SSH管理白名单: $B_WAN_IP (优先级500，确保管理流量走eth0原网关)
   路由脚本: $REMOTE_ROUTE_SCRIPT
   路由服务: $(basename "$REMOTE_ROUTE_SERVICE")
@@ -1047,11 +1219,26 @@ print_summary() {
     cat $AUTO_UPGRADE_STATE_FILE  # 查看原始状态
     rm -f $AUTO_UPGRADE_STATE_FILE && systemctl enable --now apt-daily.timer apt-daily-upgrade.timer  # 恢复
 
+EOF
+
+  # 仅在有 IPv6 出口时显示测试命令
+  if [[ $HAS_WAN_IPV6 -eq 1 ]]; then
+    local test_dev
+    if [[ $USE_SIT_TUNNEL -eq 1 ]]; then
+      test_dev="$SIT_TUNNEL_NAME"
+    else
+      test_dev="eth1"
+    fi
+    cat <<EOF
+
 IPv6 出口测试（在中国内地机器执行）:
   ping -6 $B_ETH1_IPV6_ULA                # 测试到香港端的 IPv6 连通性
   ping -6 2001:4860:4860::8888            # 测试 IPv6 出网（Google DNS）
   curl -6 ifconfig.co                     # 查看 IPv6 出口地址
+  ip -6 route show                        # 查看 IPv6 路由表
+  ip tunnel show                          # 查看隧道状态（SIT模式）
 EOF
+  fi
 }
 
 main() {
