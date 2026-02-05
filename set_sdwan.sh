@@ -55,6 +55,11 @@ A_ETH1_GW=""
 A_ETH1_HAS_IPV4=0
 A_ETH1_IP6=""
 
+# IPv6 ULA 地址配置（用于 SD-WAN IPv6 出口）
+IPV6_ULA_PREFIX="fd00:ab::"
+B_ETH1_IPV6_ULA=""   # 本端 eth1 ULA 地址
+A_ETH1_IPV6_ULA=""   # 内地端 eth1 ULA 地址
+
 LOCAL_HOSTNAME=""
 LOCAL_NIC_INFO=""
 B_SD_WAN_IF=""
@@ -309,6 +314,11 @@ gather_local_info() {
     die "无法解析本端到中国内地的接口及源IP"
   fi
 
+  # 根据本端 SD-WAN IP 最后一段生成 IPv6 ULA 地址
+  local last_octet
+  last_octet=$(awk -F. '{print $4}' <<<"$B_SD_WAN_IP")
+  B_ETH1_IPV6_ULA="${IPV6_ULA_PREFIX}${last_octet}"
+
   local default_line
   default_line=$(ip route show default 0.0.0.0/0 | head -n1 || true)
   if [[ -z $default_line ]]; then
@@ -400,23 +410,24 @@ gather_remote_info() {
     A_ETH1_HAS_IPV4=0
     A_ETH1_IP6=""
   fi
+
+  # 根据内地端 SD-WAN IP 最后一段生成 IPv6 ULA 地址
+  local a_last_octet
+  a_last_octet=$(awk -F. '{print $4}' <<<"$A_IP")
+  A_ETH1_IPV6_ULA="${IPV6_ULA_PREFIX}${a_last_octet}"
 }
 
 enable_ip_forward() {
   mkdir -p "$(dirname "$SYSCTL_FILE")"
-  if [[ -f $SYSCTL_FILE ]]; then
-    if grep -q 'net\.ipv4\.ip_forward' "$SYSCTL_FILE"; then
-      sed -i 's/^.*net\.ipv4\.ip_forward.*/net.ipv4.ip_forward = 1/' "$SYSCTL_FILE"
-    else
-      echo "net.ipv4.ip_forward = 1" >>"$SYSCTL_FILE"
-    fi
-  else
-    cat >"$SYSCTL_FILE" <<EOF
-# 自动生成，确保本端机器能转发IPv4
+  cat >"$SYSCTL_FILE" <<EOF
+# 自动生成，确保本端机器能转发IPv4和IPv6
 net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+net.ipv6.conf.default.forwarding = 1
 EOF
-  fi
   sysctl -w net.ipv4.ip_forward=1 >/dev/null
+  sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null
+  sysctl -w net.ipv6.conf.default.forwarding=1 >/dev/null
 }
 
 build_nft_elements() {
@@ -457,6 +468,12 @@ set -euo pipefail
 set +o braceexpand
 PATH=/sbin:/usr/sbin:/bin:/usr/bin
 
+# 配置本端 SD-WAN 接口的 IPv6 ULA 地址
+if ! ip -6 addr show dev "$B_SD_WAN_IF" 2>/dev/null | grep -q "${B_ETH1_IPV6_ULA}/"; then
+  ip -6 addr add ${B_ETH1_IPV6_ULA}/64 dev "$B_SD_WAN_IF" 2>/dev/null || true
+fi
+
+# IPv4 SNAT 规则
 nft delete table ip ab_snat >/dev/null 2>&1 || true
 nft -f - <<'NFT'
 table ip ab_snat {
@@ -473,12 +490,23 @@ table ip ab_snat {
   }
 }
 NFT
+
+# IPv6 NAT66 规则（让内地端 IPv6 通过本端出口）
+nft delete table ip6 ab_snat6 >/dev/null 2>&1 || true
+nft -f - <<'NFT6'
+table ip6 ab_snat6 {
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+    iifname "$B_SD_WAN_IF" oifname "$B_WAN_IF" masquerade
+  }
+}
+NFT6
 EOF
   chmod 700 "$NFT_SCRIPT_PATH"
 
   cat >"$NFT_SERVICE_PATH" <<EOF
 [Unit]
-Description=AB SNAT 规则加载
+Description=AB SNAT 规则加载 (IPv4 + IPv6)
 After=network-online.target network.target NetworkManager.service systemd-networkd.service networking.service
 Wants=network-online.target
 Requires=network-online.target
@@ -550,6 +578,10 @@ ETH1_DEV="eth1"
 ETH1_GW="$A_ETH1_GW"
 ETH1_SRC="$A_ETH1_IP"
 ETH1_HAS_IPV4="$A_ETH1_HAS_IPV4"
+
+# IPv6 ULA 配置
+IPV6_LOCAL_ULA="${A_ETH1_IPV6_ULA}/64"
+IPV6_GW_ULA="$B_ETH1_IPV6_ULA"
 
 ensure_table_entry() {
   local table_id=\$1
@@ -695,6 +727,30 @@ setup_sdwan_policy() {
   ip rule add priority "\$SDWAN_RULE_PRIORITY" lookup "\$SDWAN_TABLE_NAME"
 }
 
+setup_ipv6_route() {
+  # 配置 IPv6 ULA 地址和默认路由，让 IPv6 流量通过香港端出口
+  if [[ -z "\$IPV6_LOCAL_ULA" || -z "\$IPV6_GW_ULA" ]]; then
+    echo "IPv6 ULA 配置为空，跳过 IPv6 路由配置"
+    return 0
+  fi
+  if ! dev_exists "\$ETH1_DEV"; then
+    echo "eth1 接口不存在，跳过 IPv6 路由配置"
+    return 0
+  fi
+
+  echo "配置 IPv6 ULA 地址: \$IPV6_LOCAL_ULA on \$ETH1_DEV"
+  # 添加 ULA 地址（如果不存在）
+  if ! ip -6 addr show dev "\$ETH1_DEV" 2>/dev/null | grep -q "\${IPV6_LOCAL_ULA%/*}/"; then
+    ip -6 addr add "\$IPV6_LOCAL_ULA" dev "\$ETH1_DEV" 2>/dev/null || true
+  fi
+
+  echo "配置 IPv6 默认路由: via \$IPV6_GW_ULA dev \$ETH1_DEV"
+  # 删除已有的 ULA 网段默认路由（避免冲突）
+  ip -6 route del default via "\$IPV6_GW_ULA" dev "\$ETH1_DEV" 2>/dev/null || true
+  # 添加 IPv6 默认路由
+  ip -6 route replace default via "\$IPV6_GW_ULA" dev "\$ETH1_DEV" 2>/dev/null || true
+}
+
 rollback_all() {
   echo "检测到异常，回滚所有策略路由配置..."
   ip rule del priority "\$SDWAN_RULE_PRIORITY" 2>/dev/null || true
@@ -705,6 +761,8 @@ rollback_all() {
   done
   ip rule del priority "\$ETH1_RULE_PRIORITY" 2>/dev/null || true
   ip rule del priority "\$SSH_WHITELIST_PRIORITY" 2>/dev/null || true
+  # 回滚 IPv6 路由
+  ip -6 route del default via "\$IPV6_GW_ULA" dev "\$ETH1_DEV" 2>/dev/null || true
   echo "回滚完成"
 }
 
@@ -723,6 +781,9 @@ setup_eth0_policy
 setup_eth1_policy
 setup_ssh_whitelist
 setup_sdwan_policy
+
+# 配置 IPv6 路由（让 IPv6 流量通过香港端出口）
+setup_ipv6_route
 
 # 验证连通性，失败则回滚
 if ! verify_connectivity; then
@@ -956,16 +1017,18 @@ print_summary() {
 -------------------------
 本端机器 ($LOCAL_HOSTNAME):
   SD-WAN接口: $B_SD_WAN_IF ($B_SD_WAN_IP)
+  SD-WAN IPv6 ULA: ${B_ETH1_IPV6_ULA}/64
   WAN接口: $B_WAN_IF ($B_WAN_IP via $B_WAN_GW)
-  SNAT脚本: $NFT_SCRIPT_PATH
+  SNAT脚本: $NFT_SCRIPT_PATH (IPv4 + IPv6 NAT66)
   SNAT服务: $(basename "$NFT_SERVICE_PATH")
-  sysctl文件: $SYSCTL_FILE
+  sysctl文件: $SYSCTL_FILE (含IPv6转发)
 
 中国内地机器 ($A_HOSTNAME):
   SSH端口: $A_SSH_PORT
   中国内地接入接口: $A_SD_WAN_IF ($A_IP)
   eth0源IP: $eth0_ip_display | eth0网关: $eth0_gw_display $eth0_note
   eth1源IP: $eth1_ip_display | eth1网关: $eth1_gw_display $eth1_note
+  eth1 IPv6 ULA: ${A_ETH1_IPV6_ULA}/64 (默认路由指向 $B_ETH1_IPV6_ULA)
   SSH管理白名单: $B_WAN_IP (优先级500，确保管理流量走eth0原网关)
   路由脚本: $REMOTE_ROUTE_SCRIPT
   路由服务: $(basename "$REMOTE_ROUTE_SERVICE")
@@ -983,6 +1046,11 @@ print_summary() {
   - 自动apt更新服务已禁用（防止干扰网络配置），如需恢复请在中国内地机器执行:
     cat $AUTO_UPGRADE_STATE_FILE  # 查看原始状态
     rm -f $AUTO_UPGRADE_STATE_FILE && systemctl enable --now apt-daily.timer apt-daily-upgrade.timer  # 恢复
+
+IPv6 出口测试（在中国内地机器执行）:
+  ping -6 $B_ETH1_IPV6_ULA                # 测试到香港端的 IPv6 连通性
+  ping -6 2001:4860:4860::8888            # 测试 IPv6 出网（Google DNS）
+  curl -6 ifconfig.co                     # 查看 IPv6 出口地址
 EOF
 }
 
