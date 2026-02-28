@@ -308,16 +308,73 @@ gather_local_info() {
     esac
   done)
 
+  # 自动检测到中国内地机器的路由（作为默认推荐）
+  local auto_if="" auto_ip=""
   local route_line
-  if ! route_line=$(ip route get "$A_IP" 2>/dev/null); then
-    die "无法计算到中国内地机器($A_IP)的路由，请确认网络互通"
+  if route_line=$(ip route get "$A_IP" 2>/dev/null); then
+    auto_if=$(awk '/dev/ {for (i=1; i<=NF; i++) if ($i=="dev") {print $(i+1); exit}}' <<<"$route_line")
+    auto_ip=$(awk '/src/ {for (i=1; i<=NF; i++) if ($i=="src") {print $(i+1); exit}}' <<<"$route_line")
   fi
 
-  B_SD_WAN_IF=$(awk '/dev/ {for (i=1; i<=NF; i++) if ($i=="dev") {print $(i+1); exit}}' <<<"$route_line")
-  B_SD_WAN_IP=$(awk '/src/ {for (i=1; i<=NF; i++) if ($i=="src") {print $(i+1); exit}}' <<<"$route_line")
-  if [[ -z $B_SD_WAN_IF || -z $B_SD_WAN_IP ]]; then
-    die "无法解析本端到中国内地的接口及源IP"
+  # 列出所有网络接口供用户选择 SD-WAN 接口
+  local interfaces=() iface_ips=()
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    local iface
+    iface=$(awk '{print $1}' <<<"$line")
+    [[ -z "$iface" ]] && continue
+    local addrs
+    addrs=$(awk '{$1=$2=""; sub(/^[[:space:]]+/,""); print}' <<<"$line")
+    interfaces+=("$iface")
+    iface_ips+=("$addrs")
+  done <<<"$LOCAL_NIC_INFO"
+
+  if [[ ${#interfaces[@]} -eq 0 ]]; then
+    die "未检测到任何网络接口"
   fi
+
+  echo ""
+  info "检测到以下网络接口："
+  local default_idx=0
+  for i in "${!interfaces[@]}"; do
+    local marker=""
+    if [[ -n "$auto_if" && "${interfaces[$i]}" == "$auto_if" ]]; then
+      marker=" ← 自动检测到的SD-WAN接口"
+      default_idx=$((i+1))
+    fi
+    printf "  %d) %-12s %s%s\n" "$((i+1))" "${interfaces[$i]}" "${iface_ips[$i]}" "$marker"
+  done
+  echo ""
+
+  local prompt_text
+  if [[ $default_idx -gt 0 ]]; then
+    prompt_text="请选择本端 SD-WAN 接口 [回车默认 ${default_idx} - ${auto_if}]: "
+  else
+    prompt_text="请选择本端 SD-WAN 接口 (输入编号): "
+  fi
+
+  local choice
+  read -r -p "$prompt_text" choice
+  if [[ -z $choice ]]; then
+    if [[ $default_idx -gt 0 ]]; then
+      choice=$default_idx
+    else
+      die "未选择SD-WAN接口"
+    fi
+  fi
+
+  if ! [[ "$choice" =~ ^[0-9]+$ ]] || ((choice < 1 || choice > ${#interfaces[@]})); then
+    die "选择无效（请输入 1-${#interfaces[@]}）"
+  fi
+
+  B_SD_WAN_IF="${interfaces[$((choice-1))]}"
+  local sd_wan_cidr
+  sd_wan_cidr=$(ip -o -4 addr show dev "$B_SD_WAN_IF" | awk '{print $4}' | head -n1)
+  if [[ -z $sd_wan_cidr ]]; then
+    die "所选接口 $B_SD_WAN_IF 无IPv4地址"
+  fi
+  B_SD_WAN_IP=${sd_wan_cidr%/*}
+  info "已选择本端 SD-WAN 接口: $B_SD_WAN_IF ($B_SD_WAN_IP)"
 
   # 根据本端 SD-WAN IP 最后一段生成 IPv6 ULA 地址
   local last_octet
@@ -900,7 +957,7 @@ __ABUNIT__"
 }
 
 configure_remote_dns() {
-  info "在中国内地机器配置DNS为Cloudflare(1.1.1.1/1.0.0.1)并持久化..."
+  info "在中国内地机器配置DNS（主: $B_SD_WAN_IP / 备: 1.1.1.1）并持久化..."
   local dns_script
   dns_script=$(cat <<'EOF'
 #!/usr/bin/env bash
@@ -929,8 +986,8 @@ write_resolv_conf() {
   fi
   cat >"$DNS_FILE" <<DNSCONF
 # Managed by HaloCloud组网脚本 at $STAMP
-nameserver 1.1.1.1
-nameserver 1.0.0.1
+nameserver __DNS1__
+nameserver __DNS2__
 options timeout:2 attempts:2
 DNSCONF
   chmod 644 "$DNS_FILE"
@@ -947,11 +1004,11 @@ configure_systemd_resolved() {
     # 设置DNS
     if grep -q '^\[Resolve\]' "$resolved_conf"; then
       sed -i '/^DNS=/d; /^FallbackDNS=/d; /^DNSStubListener=/d' "$resolved_conf"
-      sed -i '/^\[Resolve\]/a DNS=1.1.1.1 1.0.0.1\nFallbackDNS=8.8.8.8 8.8.4.4\nDNSStubListener=no' "$resolved_conf"
+      sed -i '/^\[Resolve\]/a DNS=__DNS1__ __DNS2__\nFallbackDNS=8.8.8.8 8.8.4.4\nDNSStubListener=no' "$resolved_conf"
     else
       cat >>"$resolved_conf" <<RESOLVED
 [Resolve]
-DNS=1.1.1.1 1.0.0.1
+DNS=__DNS1__ __DNS2__
 FallbackDNS=8.8.8.8 8.8.4.4
 DNSStubListener=no
 RESOLVED
@@ -971,7 +1028,7 @@ configure_networkmanager() {
 dns=none
 
 [global-dns-domain-*]
-servers=1.1.1.1,1.0.0.1
+servers=__DNS1__,__DNS2__
 NMCONF
     # 重新加载 NetworkManager
     systemctl reload NetworkManager 2>/dev/null || systemctl restart NetworkManager 2>/dev/null || true
@@ -988,8 +1045,8 @@ chattr -i "$DNS_FILE" 2>/dev/null || true
 [[ -L "$DNS_FILE" ]] && rm -f "$DNS_FILE"
 cat >"$DNS_FILE" <<DNSCONF
 # Managed by HaloCloud组网脚本
-nameserver 1.1.1.1
-nameserver 1.0.0.1
+nameserver __DNS1__
+nameserver __DNS2__
 options timeout:2 attempts:2
 DNSCONF
 chmod 644 "$DNS_FILE"
@@ -1026,6 +1083,10 @@ create_dns_service
 echo "DNS配置完成并已持久化"
 EOF
 )
+
+  # 将占位符替换为实际 DNS 地址（主: 香港机器, 备: Cloudflare）
+  dns_script="${dns_script//__DNS1__/$B_SD_WAN_IP}"
+  dns_script="${dns_script//__DNS2__/1.1.1.1}"
 
   ssh_remote "cat <<'__DNS__' > /tmp/ab-set-dns.sh
 $dns_script
@@ -1117,6 +1178,7 @@ print_summary() {
   SSH管理白名单: $B_WAN_IP (优先级500，确保管理流量走eth0原网关)
   路由脚本: $REMOTE_ROUTE_SCRIPT
   路由服务: $(basename "$REMOTE_ROUTE_SERVICE")
+  DNS: $B_SD_WAN_IP (主) / 1.1.1.1 (备)
   DNS脚本: /usr/local/sbin/ab-dns-setup.sh
   DNS服务: ab-dns-setup.service (重启后自动恢复DNS)
   IPv4优先: /etc/gai.conf (precedence ::ffff:0:0/96 100)
