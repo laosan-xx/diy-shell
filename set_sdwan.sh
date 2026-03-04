@@ -62,6 +62,7 @@ A_ETH1_IPV6_ULA=""   # 内地端 eth1 ULA 地址
 
 # IPv6 出口检测
 B_WAN_IPV6=""        # 本端 WAN 口的 IPv6 地址
+B_WAN_IPV6_GW=""     # 本端 WAN 口的 IPv6 网关
 HAS_WAN_IPV6=0       # 本端 WAN 是否有 IPv6
 SIT_TUNNEL_NAME="sit-ab"  # SIT 隧道名称（IPv6 over IPv4）
 
@@ -406,8 +407,20 @@ gather_local_info() {
     B_WAN_IPV6=${wan_ipv6_cidr%/*}
     HAS_WAN_IPV6=1
     info "检测到本端WAN口($B_WAN_IF)有全局IPv6地址: $B_WAN_IPV6"
+
+    # 检测 IPv6 网关（用于修复多路径默认路由问题）
+    local wan_ipv6_gw
+    wan_ipv6_gw=$(ip -6 route show default dev "$B_WAN_IF" | awk '/via/{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}' | head -n1 || true)
+    if [[ -n $wan_ipv6_gw ]]; then
+      B_WAN_IPV6_GW="$wan_ipv6_gw"
+      info "检测到本端WAN口IPv6网关: $B_WAN_IPV6_GW"
+    else
+      B_WAN_IPV6_GW=""
+      warn "未检测到本端WAN口IPv6网关，将在运行时动态检测"
+    fi
   else
     HAS_WAN_IPV6=0
+    B_WAN_IPV6_GW=""
     info "本端WAN口($B_WAN_IF)无全局IPv6地址，IPv6出口功能将不可用"
   fi
 }
@@ -588,6 +601,23 @@ table ip6 ab_snat6 {
   }
 }
 NFT6
+
+# ========== 修复 IPv6 默认路由（防止 ECMP 多路径导致间歇性失败） ==========
+# 系统可能通过 RA 学到多条 nexthop（含非 WAN 接口），导致 IPv6 流量随机走错路径
+IPV6_GW="${B_WAN_IPV6_GW}"
+if [[ -z "\$IPV6_GW" ]]; then
+  # 运行时动态检测 WAN 口的 IPv6 网关
+  IPV6_GW=\$(ip -6 route show default dev $B_WAN_IF 2>/dev/null | awk '/via/{for(i=1;i<=NF;i++) if(\$i=="via"){print \$(i+1); exit}}' | head -n1 || true)
+fi
+if [[ -n "\$IPV6_GW" ]]; then
+  # 检查当前默认路由是否为多路径（含多个 nexthop）
+  nhcount=\$(ip -6 route show default 2>/dev/null | grep -c 'nexthop' || echo 0)
+  if [[ "\$nhcount" -gt 1 ]]; then
+    echo "检测到 IPv6 多路径默认路由(\${nhcount}条nexthop)，修复为仅走 $B_WAN_IF..."
+    ip -6 route del default 2>/dev/null || true
+    ip -6 route add default via "\$IPV6_GW" dev $B_WAN_IF 2>/dev/null || true
+  fi
+fi
 EOF
   else
     # 无 WAN IPv6，仅配置 IPv4 SNAT
