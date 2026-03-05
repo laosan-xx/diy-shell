@@ -24,6 +24,8 @@ NSPROXY_REMOTE_PATH="/usr/local/bin/nsproxy"
 ROUTE_TABLE_NAME="ix_return"
 ROUTE_TABLE_ID="100"
 ROUTE_MARK="100"
+SSH_DIRECT_MARK="110"
+SSH_DIRECT_PORTS="22 2345"
 AUTO_UPGRADE_STATE_FILE="/etc/qh_auto_upgrade_state"
 
 # 状态变量
@@ -108,10 +110,14 @@ clean_remote_legacy_rules() {
   remote_sudo "iptables -t nat -X hk_snat 2>/dev/null || true"
   remote_sudo "iptables -t mangle -D PREROUTING -i $QH_EXTERNAL_IF -j CONNMARK --set-mark $ROUTE_MARK 2>/dev/null || true"
   remote_sudo "iptables -t mangle -D OUTPUT -j CONNMARK --restore-mark 2>/dev/null || true"
+  remote_sudo "for p in $SSH_DIRECT_PORTS; do iptables -t mangle -D OUTPUT -p tcp --dport \$p -j MARK --set-mark $SSH_DIRECT_MARK 2>/dev/null || true; done"
   remote_sudo "if command -v ip6tables >/dev/null 2>&1; then ip6tables -t mangle -D PREROUTING -i $QH_EXTERNAL_IF -j CONNMARK --set-mark $ROUTE_MARK 2>/dev/null || true; ip6tables -t mangle -D OUTPUT -j CONNMARK --restore-mark 2>/dev/null || true; fi"
+  remote_sudo "if command -v ip6tables >/dev/null 2>&1; then for p in $SSH_DIRECT_PORTS; do ip6tables -t mangle -D OUTPUT -p tcp --dport \$p -j MARK --set-mark $SSH_DIRECT_MARK 2>/dev/null || true; done; fi"
   remote_sudo "ip rule del fwmark 200 table kkix_direct_rt 2>/dev/null || true"
   remote_sudo "ip rule del table kkix_direct_rt 2>/dev/null || true"
   remote_sudo "ip route flush table kkix_direct_rt 2>/dev/null || true"
+  remote_sudo "while ip rule del fwmark $SSH_DIRECT_MARK table $ROUTE_TABLE_NAME 2>/dev/null; do :; done"
+  remote_sudo "while ip -6 rule del fwmark $SSH_DIRECT_MARK table $ROUTE_TABLE_NAME 2>/dev/null; do :; done"
 }
 
 ensure_state_dir() {
@@ -2033,6 +2039,9 @@ if [ "\$USE_NFT" -eq 1 ]; then
   nft 'add rule ip hk_snat forward ip saddr $QIANHAI_LAN_IP iif $HK_INTERNAL_IF oif $HK_EXTERNAL_IF accept'
   nft 'add rule ip hk_snat postrouting ip saddr $HK_INTERNAL_NETWORK oif $HK_EXTERNAL_IF snat to $HK_EXTERNAL_IP'
   if [ -w /etc/nftables.conf ]; then
+    nft list ruleset > /etc/nftables.conf 2>/dev/null || true
+  elif command -v netfilter-persistent >/dev/null 2>&1; then
+    netfilter-persistent save >/dev/null 2>&1 || true
   fi
 else
   # 启用IP转发
@@ -2078,7 +2087,7 @@ HKSERVICE_EOF
 
   # 启用服务
   systemctl daemon-reload >/dev/null 2>&1
-  systemctl enable hk-snat-restore.service >/dev/null 2>&1
+  systemctl enable --now hk-snat-restore.service >/dev/null 2>&1
   info "已创建香港端开机自动恢复服务"
 
   # 防止cloud-init重置网络配置
@@ -2471,10 +2480,12 @@ RTEOF"
     qh_ext_ip_for_rule=$(echo "$qh_ext_ip_for_rule" | cut -d/ -f1)
   fi
   remote_sudo "$ip_ext_cmd rule add from $qh_ext_ip_for_rule table $ROUTE_TABLE_NAME priority 100"
+  remote_sudo "$ip_ext_cmd rule add fwmark $SSH_DIRECT_MARK table $ROUTE_TABLE_NAME priority 98"
   remote_sudo "$ip_ext_cmd rule add fwmark $ROUTE_MARK table $ROUTE_TABLE_NAME priority 99"
 
   # 配置连接跟踪
   info "配置连接跟踪..."
+  local ssh_direct_ports_nft="${SSH_DIRECT_PORTS// /, }"
   if (( remote_use_nft )); then
     remote_sudo "nft delete table inet qh_mark >/dev/null 2>&1 || true"
     remote_sudo "nft add table inet qh_mark"
@@ -2482,14 +2493,16 @@ RTEOF"
     remote_sudo "nft 'add chain inet qh_mark output { type route hook output priority -150; policy accept; }'"
     remote_sudo "nft \"add rule inet qh_mark prerouting iif $QH_EXTERNAL_IF ct mark set $ROUTE_MARK\""
     remote_sudo "nft 'add rule inet qh_mark output meta mark set ct mark'"
+    remote_sudo "nft 'add rule inet qh_mark output tcp dport { $ssh_direct_ports_nft } meta mark set $SSH_DIRECT_MARK'"
   else
     remote_sudo "iptables -t mangle -D PREROUTING -i $QH_EXTERNAL_IF -j CONNMARK --set-mark $ROUTE_MARK 2>/dev/null || true"
     remote_sudo "iptables -t mangle -D OUTPUT -j CONNMARK --restore-mark 2>/dev/null || true"
 
     remote_sudo "iptables -t mangle -A PREROUTING -i $QH_EXTERNAL_IF -j CONNMARK --set-mark $ROUTE_MARK"
     remote_sudo "iptables -t mangle -A OUTPUT -j CONNMARK --restore-mark"
+    remote_sudo "for p in $SSH_DIRECT_PORTS; do iptables -t mangle -A OUTPUT -p tcp --dport \$p -j MARK --set-mark $SSH_DIRECT_MARK; done"
     if [[ "$qh_external_family" == "6" ]]; then
-      remote_sudo "if command -v ip6tables >/dev/null 2>&1; then ip6tables -t mangle -D PREROUTING -i $QH_EXTERNAL_IF -j CONNMARK --set-mark $ROUTE_MARK 2>/dev/null || true; ip6tables -t mangle -D OUTPUT -j CONNMARK --restore-mark 2>/dev/null || true; ip6tables -t mangle -A PREROUTING -i $QH_EXTERNAL_IF -j CONNMARK --set-mark $ROUTE_MARK; ip6tables -t mangle -A OUTPUT -j CONNMARK --restore-mark; fi"
+      remote_sudo "if command -v ip6tables >/dev/null 2>&1; then ip6tables -t mangle -D PREROUTING -i $QH_EXTERNAL_IF -j CONNMARK --set-mark $ROUTE_MARK 2>/dev/null || true; ip6tables -t mangle -D OUTPUT -j CONNMARK --restore-mark 2>/dev/null || true; for p in $SSH_DIRECT_PORTS; do ip6tables -t mangle -D OUTPUT -p tcp --dport \$p -j MARK --set-mark $SSH_DIRECT_MARK 2>/dev/null || true; done; ip6tables -t mangle -A PREROUTING -i $QH_EXTERNAL_IF -j CONNMARK --set-mark $ROUTE_MARK; ip6tables -t mangle -A OUTPUT -j CONNMARK --restore-mark; for p in $SSH_DIRECT_PORTS; do ip6tables -t mangle -A OUTPUT -p tcp --dport \$p -j MARK --set-mark $SSH_DIRECT_MARK; done; fi"
     fi
   fi
 
@@ -2529,12 +2542,9 @@ set +u 2>/dev/null || true
 # 等待网络接口就绪
 sleep 10
 
-IP_EXT_FAMILY=4
+IP_EXT_FAMILY=$qh_external_family
 IP_EXT_CMD='ip'
 IPT6_NEEDED=0
-if ip -6 addr show "$QH_EXTERNAL_IF" scope global 2>/dev/null | grep -q .; then
-  IP_EXT_FAMILY=6
-fi
 if [ "\$IP_EXT_FAMILY" = "6" ]; then
   IP_EXT_CMD='ip -6'
   IPT6_NEEDED=1
@@ -2553,8 +2563,17 @@ fi
 if [ -f /etc/qh_default_route_mode ]; then
   DEFAULT_MODE=\$(cat /etc/qh_default_route_mode)
   if [ "\$DEFAULT_MODE" = "hk" ]; then
-    # 恢复默认路由到香港端
-    if ping -c 2 -W 2 $qh_int_gw >/dev/null 2>&1; then
+    # 重试 ping 香港端（两端同时重启时香港端可能还没就绪）
+    HK_REACHABLE=0
+    for _attempt in 1 2 3 4 5; do
+      if ping -c 2 -W 3 $qh_int_gw >/dev/null 2>&1; then
+        HK_REACHABLE=1
+        break
+      fi
+      sleep 10
+    done
+
+    if [ "\$HK_REACHABLE" = "1" ]; then
       ip route del default 2>/dev/null || true
       if [ "\$IP_EXT_FAMILY" = "6" ]; then
         \$IP_EXT_CMD route del default 2>/dev/null || true
@@ -2562,12 +2581,12 @@ if [ -f /etc/qh_default_route_mode ]; then
       ip route add default via $qh_int_gw dev $QH_INTERNAL_IF
       logger -t restore-route 'Default route restored to HK'
     else
-      # 香港端不可达，使用外网路由
-      ip route del default 2>/dev/null || true
+      # 香港端不可达，仅回退对应 IP 族的默认路由
       if [ "\$IP_EXT_FAMILY" = "6" ]; then
         \$IP_EXT_CMD route del default 2>/dev/null || true
         \$IP_EXT_CMD route add default via $QH_EXTERNAL_GW dev $QH_EXTERNAL_IF
       else
+        ip route del default 2>/dev/null || true
         ip route add default via $QH_EXTERNAL_GW dev $QH_EXTERNAL_IF
       fi
       logger -t restore-route 'HK unreachable, using external route'
@@ -2595,12 +2614,17 @@ QH_INT_IP_CLEAN=\${QH_INT_IP%%/*}
 # 清理旧规则
 while \$IP_EXT_CMD rule del from \$QH_EXT_IP_CLEAN table ix_return 2>/dev/null; do :; done
 while ip rule del from \$QH_INT_IP_CLEAN table internal_out 2>/dev/null; do :; done
+while \$IP_EXT_CMD rule del fwmark $SSH_DIRECT_MARK table ix_return 2>/dev/null; do :; done
 while \$IP_EXT_CMD rule del fwmark 100 table ix_return 2>/dev/null; do :; done
 
 # 恢复策略路由规则
 ip rule add from \$QH_INT_IP_CLEAN table internal_out priority 90
 \$IP_EXT_CMD rule add from \$QH_EXT_IP_CLEAN table ix_return priority 100
+\$IP_EXT_CMD rule add fwmark $SSH_DIRECT_MARK table ix_return priority 98
 \$IP_EXT_CMD rule add fwmark 100 table ix_return priority 99
+
+SSH_DIRECT_PORTS='$SSH_DIRECT_PORTS'
+SSH_DIRECT_PORTS_NFT=\${SSH_DIRECT_PORTS// /, }
 
   if command -v nft >/dev/null 2>&1; then
     nft delete table inet qh_mark >/dev/null 2>&1 || true
@@ -2609,17 +2633,30 @@ ip rule add from \$QH_INT_IP_CLEAN table internal_out priority 90
     nft 'add chain inet qh_mark output { type route hook output priority -150; policy accept; }'
   nft "add rule inet qh_mark prerouting iif $QH_EXTERNAL_IF ct mark set 100"
   nft 'add rule inet qh_mark output meta mark set ct mark'
+  nft "add rule inet qh_mark output tcp dport { \$SSH_DIRECT_PORTS_NFT } meta mark set $SSH_DIRECT_MARK"
   else
     # 恢复iptables规则
     iptables -t mangle -D PREROUTING -i $QH_EXTERNAL_IF -j CONNMARK --set-mark 100 2>/dev/null || true
     iptables -t mangle -D OUTPUT -j CONNMARK --restore-mark 2>/dev/null || true
+    for p in \$SSH_DIRECT_PORTS; do
+      iptables -t mangle -D OUTPUT -p tcp --dport \$p -j MARK --set-mark $SSH_DIRECT_MARK 2>/dev/null || true
+    done
     iptables -t mangle -A PREROUTING -i $QH_EXTERNAL_IF -j CONNMARK --set-mark 100
     iptables -t mangle -A OUTPUT -j CONNMARK --restore-mark
+    for p in \$SSH_DIRECT_PORTS; do
+      iptables -t mangle -A OUTPUT -p tcp --dport \$p -j MARK --set-mark $SSH_DIRECT_MARK
+    done
     if [ "\$IPT6_NEEDED" -eq 1 ] && command -v ip6tables >/dev/null 2>&1; then
       ip6tables -t mangle -D PREROUTING -i $QH_EXTERNAL_IF -j CONNMARK --set-mark 100 2>/dev/null || true
       ip6tables -t mangle -D OUTPUT -j CONNMARK --restore-mark 2>/dev/null || true
+      for p in \$SSH_DIRECT_PORTS; do
+        ip6tables -t mangle -D OUTPUT -p tcp --dport \$p -j MARK --set-mark $SSH_DIRECT_MARK 2>/dev/null || true
+      done
       ip6tables -t mangle -A PREROUTING -i $QH_EXTERNAL_IF -j CONNMARK --set-mark 100
       ip6tables -t mangle -A OUTPUT -j CONNMARK --restore-mark
+      for p in \$SSH_DIRECT_PORTS; do
+        ip6tables -t mangle -A OUTPUT -p tcp --dport \$p -j MARK --set-mark $SSH_DIRECT_MARK
+      done
     fi
 fi
 
@@ -2684,10 +2721,7 @@ remote_sudo "cat > /usr/local/bin/check-network.sh << 'CHECK_EOF'
 # 避免环境中 set -u 导致未定义变量报错
 set +u 2>/dev/null || true
 
-IP_EXT_FAMILY=4
-if ip -6 addr show "$QH_EXTERNAL_IF" scope global 2>/dev/null | grep -q .; then
-  IP_EXT_FAMILY=6
-fi
+IP_EXT_FAMILY=$qh_external_family
 IP_EXT_CMD='ip'
 if [ "\$IP_EXT_FAMILY" = "6" ]; then
   IP_EXT_CMD='ip -6'
@@ -2695,12 +2729,12 @@ fi
 
 # 检查是否能ping通网关
 if ! ping -c 2 -W 2 $qh_int_gw >/dev/null 2>&1; then
-  # 恢复默认路由到外网接口
-  ip route del default 2>/dev/null || true
+  # 香港端不可达，仅回退对应 IP 族的默认路由
   if [ "\$IP_EXT_FAMILY" = "6" ]; then
     \$IP_EXT_CMD route del default 2>/dev/null || true
     \$IP_EXT_CMD route add default via $QH_EXTERNAL_GW dev $QH_EXTERNAL_IF
   else
+    ip route del default 2>/dev/null || true
     ip route add default via $QH_EXTERNAL_GW dev $QH_EXTERNAL_IF
   fi
   logger -t network-check 'Network check failed, restored original route'
@@ -2709,6 +2743,16 @@ if ! ping -c 2 -W 2 $qh_int_gw >/dev/null 2>&1; then
   chattr -i /etc/resolv.conf 2>/dev/null || true
   if [ -f /etc/resolv.conf.backup ]; then
     cp /etc/resolv.conf.backup /etc/resolv.conf
+  fi
+else
+  # 香港端可达，如果默认路由模式是 hk 则确保 IPv4 默认路由指向香港
+  if [ -f /etc/qh_default_route_mode ] && [ \"\$(cat /etc/qh_default_route_mode)\" = \"hk\" ]; then
+    CURRENT_GW=\$(ip route show default 2>/dev/null | awk '{print \$3; exit}')
+    if [ \"\$CURRENT_GW\" != \"$qh_int_gw\" ]; then
+      ip route del default 2>/dev/null || true
+      ip route add default via $qh_int_gw dev $QH_INTERNAL_IF
+      logger -t network-check \"Restored HK default route (was: \$CURRENT_GW)\"
+    fi
   fi
 fi
 CHECK_EOF"
@@ -2875,6 +2919,7 @@ clear_qh_route() {
 
   remote_sudo "while $ip_ext_cmd rule del from $qh_ext_ip_clean table $ROUTE_TABLE_NAME 2>/dev/null; do :; done"
   remote_sudo "while $ip_int_cmd rule del from $qh_int_ip table internal_out 2>/dev/null; do :; done"
+  remote_sudo "while $ip_ext_cmd rule del fwmark $SSH_DIRECT_MARK table $ROUTE_TABLE_NAME 2>/dev/null; do :; done"
   remote_sudo "while $ip_ext_cmd rule del fwmark $ROUTE_MARK table $ROUTE_TABLE_NAME 2>/dev/null; do :; done"
 
   # 清空路由表
@@ -2889,8 +2934,9 @@ clear_qh_route() {
   remote_sudo "nft delete table inet qh_mark >/dev/null 2>&1 || true"
   remote_sudo "iptables -t mangle -D PREROUTING -i $QH_EXTERNAL_IF -j CONNMARK --set-mark $ROUTE_MARK 2>/dev/null || true"
   remote_sudo "iptables -t mangle -D OUTPUT -j CONNMARK --restore-mark 2>/dev/null || true"
+  remote_sudo "for p in $SSH_DIRECT_PORTS; do iptables -t mangle -D OUTPUT -p tcp --dport \$p -j MARK --set-mark $SSH_DIRECT_MARK 2>/dev/null || true; done"
   if [[ "$qh_external_family" == "6" ]]; then
-    remote_sudo "if command -v ip6tables >/dev/null 2>&1; then ip6tables -t mangle -D PREROUTING -i $QH_EXTERNAL_IF -j CONNMARK --set-mark $ROUTE_MARK 2>/dev/null || true; ip6tables -t mangle -D OUTPUT -j CONNMARK --restore-mark 2>/dev/null || true; fi"
+    remote_sudo "if command -v ip6tables >/dev/null 2>&1; then ip6tables -t mangle -D PREROUTING -i $QH_EXTERNAL_IF -j CONNMARK --set-mark $ROUTE_MARK 2>/dev/null || true; ip6tables -t mangle -D OUTPUT -j CONNMARK --restore-mark 2>/dev/null || true; for p in $SSH_DIRECT_PORTS; do ip6tables -t mangle -D OUTPUT -p tcp --dport \$p -j MARK --set-mark $SSH_DIRECT_MARK 2>/dev/null || true; done; fi"
   fi
 
   # 恢复原始默认路由
