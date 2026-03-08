@@ -110,9 +110,9 @@ clean_remote_legacy_rules() {
   remote_sudo "iptables -t nat -X hk_snat 2>/dev/null || true"
   remote_sudo "iptables -t mangle -D PREROUTING -i $QH_EXTERNAL_IF -j CONNMARK --set-mark $ROUTE_MARK 2>/dev/null || true"
   remote_sudo "iptables -t mangle -D OUTPUT -j CONNMARK --restore-mark 2>/dev/null || true"
-  remote_sudo "for p in $SSH_DIRECT_PORTS; do iptables -t mangle -D OUTPUT -p tcp --dport \$p -j MARK --set-mark $SSH_DIRECT_MARK 2>/dev/null || true; done"
+  remote_sudo "for p in $SSH_DIRECT_PORTS; do iptables -t mangle -D OUTPUT -p tcp --sport \$p -j MARK --set-mark $SSH_DIRECT_MARK 2>/dev/null || true; iptables -t mangle -D OUTPUT -p tcp --dport \$p -j MARK --set-mark $SSH_DIRECT_MARK 2>/dev/null || true; done"
   remote_sudo "if command -v ip6tables >/dev/null 2>&1; then ip6tables -t mangle -D PREROUTING -i $QH_EXTERNAL_IF -j CONNMARK --set-mark $ROUTE_MARK 2>/dev/null || true; ip6tables -t mangle -D OUTPUT -j CONNMARK --restore-mark 2>/dev/null || true; fi"
-  remote_sudo "if command -v ip6tables >/dev/null 2>&1; then for p in $SSH_DIRECT_PORTS; do ip6tables -t mangle -D OUTPUT -p tcp --dport \$p -j MARK --set-mark $SSH_DIRECT_MARK 2>/dev/null || true; done; fi"
+  remote_sudo "if command -v ip6tables >/dev/null 2>&1; then for p in $SSH_DIRECT_PORTS; do ip6tables -t mangle -D OUTPUT -p tcp --sport \$p -j MARK --set-mark $SSH_DIRECT_MARK 2>/dev/null || true; ip6tables -t mangle -D OUTPUT -p tcp --dport \$p -j MARK --set-mark $SSH_DIRECT_MARK 2>/dev/null || true; done; fi"
   remote_sudo "ip rule del fwmark 200 table kkix_direct_rt 2>/dev/null || true"
   remote_sudo "ip rule del table kkix_direct_rt 2>/dev/null || true"
   remote_sudo "ip route flush table kkix_direct_rt 2>/dev/null || true"
@@ -2493,6 +2493,7 @@ RTEOF"
     remote_sudo "nft 'add chain inet qh_mark output { type route hook output priority -150; policy accept; }'"
     remote_sudo "nft \"add rule inet qh_mark prerouting iif $QH_EXTERNAL_IF ct mark set $ROUTE_MARK\""
     remote_sudo "nft 'add rule inet qh_mark output meta mark set ct mark'"
+    remote_sudo "nft 'add rule inet qh_mark output tcp sport { $ssh_direct_ports_nft } meta mark set $SSH_DIRECT_MARK'"
     remote_sudo "nft 'add rule inet qh_mark output tcp dport { $ssh_direct_ports_nft } meta mark set $SSH_DIRECT_MARK'"
   else
     remote_sudo "iptables -t mangle -D PREROUTING -i $QH_EXTERNAL_IF -j CONNMARK --set-mark $ROUTE_MARK 2>/dev/null || true"
@@ -2500,9 +2501,9 @@ RTEOF"
 
     remote_sudo "iptables -t mangle -A PREROUTING -i $QH_EXTERNAL_IF -j CONNMARK --set-mark $ROUTE_MARK"
     remote_sudo "iptables -t mangle -A OUTPUT -j CONNMARK --restore-mark"
-    remote_sudo "for p in $SSH_DIRECT_PORTS; do iptables -t mangle -A OUTPUT -p tcp --dport \$p -j MARK --set-mark $SSH_DIRECT_MARK; done"
+    remote_sudo "for p in $SSH_DIRECT_PORTS; do iptables -t mangle -A OUTPUT -p tcp --sport \$p -j MARK --set-mark $SSH_DIRECT_MARK; iptables -t mangle -A OUTPUT -p tcp --dport \$p -j MARK --set-mark $SSH_DIRECT_MARK; done"
     if [[ "$qh_external_family" == "6" ]]; then
-      remote_sudo "if command -v ip6tables >/dev/null 2>&1; then ip6tables -t mangle -D PREROUTING -i $QH_EXTERNAL_IF -j CONNMARK --set-mark $ROUTE_MARK 2>/dev/null || true; ip6tables -t mangle -D OUTPUT -j CONNMARK --restore-mark 2>/dev/null || true; for p in $SSH_DIRECT_PORTS; do ip6tables -t mangle -D OUTPUT -p tcp --dport \$p -j MARK --set-mark $SSH_DIRECT_MARK 2>/dev/null || true; done; ip6tables -t mangle -A PREROUTING -i $QH_EXTERNAL_IF -j CONNMARK --set-mark $ROUTE_MARK; ip6tables -t mangle -A OUTPUT -j CONNMARK --restore-mark; for p in $SSH_DIRECT_PORTS; do ip6tables -t mangle -A OUTPUT -p tcp --dport \$p -j MARK --set-mark $SSH_DIRECT_MARK; done; fi"
+      remote_sudo "if command -v ip6tables >/dev/null 2>&1; then ip6tables -t mangle -D PREROUTING -i $QH_EXTERNAL_IF -j CONNMARK --set-mark $ROUTE_MARK 2>/dev/null || true; ip6tables -t mangle -D OUTPUT -j CONNMARK --restore-mark 2>/dev/null || true; for p in $SSH_DIRECT_PORTS; do ip6tables -t mangle -D OUTPUT -p tcp --sport \$p -j MARK --set-mark $SSH_DIRECT_MARK 2>/dev/null || true; ip6tables -t mangle -D OUTPUT -p tcp --dport \$p -j MARK --set-mark $SSH_DIRECT_MARK 2>/dev/null || true; done; ip6tables -t mangle -A PREROUTING -i $QH_EXTERNAL_IF -j CONNMARK --set-mark $ROUTE_MARK; ip6tables -t mangle -A OUTPUT -j CONNMARK --restore-mark; for p in $SSH_DIRECT_PORTS; do ip6tables -t mangle -A OUTPUT -p tcp --sport \$p -j MARK --set-mark $SSH_DIRECT_MARK; ip6tables -t mangle -A OUTPUT -p tcp --dport \$p -j MARK --set-mark $SSH_DIRECT_MARK; done; fi"
     fi
   fi
 
@@ -2633,28 +2634,33 @@ SSH_DIRECT_PORTS_NFT=\${SSH_DIRECT_PORTS// /, }
     nft 'add chain inet qh_mark output { type route hook output priority -150; policy accept; }'
   nft "add rule inet qh_mark prerouting iif $QH_EXTERNAL_IF ct mark set 100"
   nft 'add rule inet qh_mark output meta mark set ct mark'
+  nft "add rule inet qh_mark output tcp sport { \$SSH_DIRECT_PORTS_NFT } meta mark set $SSH_DIRECT_MARK"
   nft "add rule inet qh_mark output tcp dport { \$SSH_DIRECT_PORTS_NFT } meta mark set $SSH_DIRECT_MARK"
   else
     # 恢复iptables规则
     iptables -t mangle -D PREROUTING -i $QH_EXTERNAL_IF -j CONNMARK --set-mark 100 2>/dev/null || true
     iptables -t mangle -D OUTPUT -j CONNMARK --restore-mark 2>/dev/null || true
     for p in \$SSH_DIRECT_PORTS; do
+      iptables -t mangle -D OUTPUT -p tcp --sport \$p -j MARK --set-mark $SSH_DIRECT_MARK 2>/dev/null || true
       iptables -t mangle -D OUTPUT -p tcp --dport \$p -j MARK --set-mark $SSH_DIRECT_MARK 2>/dev/null || true
     done
     iptables -t mangle -A PREROUTING -i $QH_EXTERNAL_IF -j CONNMARK --set-mark 100
     iptables -t mangle -A OUTPUT -j CONNMARK --restore-mark
     for p in \$SSH_DIRECT_PORTS; do
+      iptables -t mangle -A OUTPUT -p tcp --sport \$p -j MARK --set-mark $SSH_DIRECT_MARK
       iptables -t mangle -A OUTPUT -p tcp --dport \$p -j MARK --set-mark $SSH_DIRECT_MARK
     done
     if [ "\$IPT6_NEEDED" -eq 1 ] && command -v ip6tables >/dev/null 2>&1; then
       ip6tables -t mangle -D PREROUTING -i $QH_EXTERNAL_IF -j CONNMARK --set-mark 100 2>/dev/null || true
       ip6tables -t mangle -D OUTPUT -j CONNMARK --restore-mark 2>/dev/null || true
       for p in \$SSH_DIRECT_PORTS; do
+        ip6tables -t mangle -D OUTPUT -p tcp --sport \$p -j MARK --set-mark $SSH_DIRECT_MARK 2>/dev/null || true
         ip6tables -t mangle -D OUTPUT -p tcp --dport \$p -j MARK --set-mark $SSH_DIRECT_MARK 2>/dev/null || true
       done
       ip6tables -t mangle -A PREROUTING -i $QH_EXTERNAL_IF -j CONNMARK --set-mark 100
       ip6tables -t mangle -A OUTPUT -j CONNMARK --restore-mark
       for p in \$SSH_DIRECT_PORTS; do
+        ip6tables -t mangle -A OUTPUT -p tcp --sport \$p -j MARK --set-mark $SSH_DIRECT_MARK
         ip6tables -t mangle -A OUTPUT -p tcp --dport \$p -j MARK --set-mark $SSH_DIRECT_MARK
       done
     fi
@@ -2934,9 +2940,9 @@ clear_qh_route() {
   remote_sudo "nft delete table inet qh_mark >/dev/null 2>&1 || true"
   remote_sudo "iptables -t mangle -D PREROUTING -i $QH_EXTERNAL_IF -j CONNMARK --set-mark $ROUTE_MARK 2>/dev/null || true"
   remote_sudo "iptables -t mangle -D OUTPUT -j CONNMARK --restore-mark 2>/dev/null || true"
-  remote_sudo "for p in $SSH_DIRECT_PORTS; do iptables -t mangle -D OUTPUT -p tcp --dport \$p -j MARK --set-mark $SSH_DIRECT_MARK 2>/dev/null || true; done"
+  remote_sudo "for p in $SSH_DIRECT_PORTS; do iptables -t mangle -D OUTPUT -p tcp --sport \$p -j MARK --set-mark $SSH_DIRECT_MARK 2>/dev/null || true; iptables -t mangle -D OUTPUT -p tcp --dport \$p -j MARK --set-mark $SSH_DIRECT_MARK 2>/dev/null || true; done"
   if [[ "$qh_external_family" == "6" ]]; then
-    remote_sudo "if command -v ip6tables >/dev/null 2>&1; then ip6tables -t mangle -D PREROUTING -i $QH_EXTERNAL_IF -j CONNMARK --set-mark $ROUTE_MARK 2>/dev/null || true; ip6tables -t mangle -D OUTPUT -j CONNMARK --restore-mark 2>/dev/null || true; for p in $SSH_DIRECT_PORTS; do ip6tables -t mangle -D OUTPUT -p tcp --dport \$p -j MARK --set-mark $SSH_DIRECT_MARK 2>/dev/null || true; done; fi"
+    remote_sudo "if command -v ip6tables >/dev/null 2>&1; then ip6tables -t mangle -D PREROUTING -i $QH_EXTERNAL_IF -j CONNMARK --set-mark $ROUTE_MARK 2>/dev/null || true; ip6tables -t mangle -D OUTPUT -j CONNMARK --restore-mark 2>/dev/null || true; for p in $SSH_DIRECT_PORTS; do ip6tables -t mangle -D OUTPUT -p tcp --sport \$p -j MARK --set-mark $SSH_DIRECT_MARK 2>/dev/null || true; ip6tables -t mangle -D OUTPUT -p tcp --dport \$p -j MARK --set-mark $SSH_DIRECT_MARK 2>/dev/null || true; done; fi"
   fi
 
   # 恢复原始默认路由
