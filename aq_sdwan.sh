@@ -61,6 +61,21 @@ CURRENT_QH_INT_GW=""
 IPV6_ULA_PREFIX="fd00:ab::"
 SIT_TUNNEL_NAME="kkix-sit"
 
+# 内网中转相关
+RELAY_SIT_NAME="kkix-relay"
+RELAY_ULA_PREFIX="fd00:ab:1::"
+RELAY_FLAG="$STATE_DIR/relay_ready"
+RELAY_META="$STATE_DIR/relay_meta"
+RELAY_CONFIG_FILE="/root/.kkix_relay_config"
+RELAY_INFO_READY=0
+RELAY_LOCAL_IF=""
+RELAY_LOCAL_IP=""
+RELAY_TUNNEL_IF=""
+RELAY_REMOTE_IP=""
+RELAY_REMOTE_EXT_IF=""
+RELAY_REMOTE_INT_IF=""
+RELAY_REMOTE_EXT_GW6=""
+
 # SSH连接变量
 REMOTE_USER=""
 REMOTE_PORT=""
@@ -2460,17 +2475,9 @@ RTEOF"
     qh_int_ip_pure=$(echo "$qh_int_ip_pure" | cut -d/ -f1)
   fi
 
-  # 添加网段路由，但更安全地处理
-  # 对于外网，如果网段有问题，只添加连接路由
-  if [[ -n "$qh_ext_network" ]]; then
-    # 尝试添加，如果失败则跳过
-    remote_sudo "$ip_ext_cmd route add $qh_ext_network dev $QH_EXTERNAL_IF src $qh_ext_ip_pure table $ROUTE_TABLE_NAME 2>/dev/null || true"
-  fi
-
-  # 对于内网，尝试添加路由
-  if [[ -n "$qh_int_network" ]]; then
-    remote_sudo "$ip_int_cmd route add $qh_int_network dev $QH_INTERNAL_IF src $qh_int_ip_pure table $ROUTE_TABLE_NAME 2>/dev/null || true"
-  fi
+  # 将所有直连网段加入回程路由表，避免策略路由导致内网流量被误导到外网网关
+  info "将本机所有直连网段加入回程路由表..."
+  remote_sudo "ip -4 route show scope link 2>/dev/null | while IFS= read -r rt; do ip route add \$rt table $ROUTE_TABLE_NAME 2>/dev/null || true; done"
 
   # 添加策略路由规则
   info "添加策略路由规则..."
@@ -2598,6 +2605,9 @@ fi
 
 \$IP_EXT_CMD route flush table ix_return 2>/dev/null || true
 \$IP_EXT_CMD route add default via $QH_EXTERNAL_GW dev $QH_EXTERNAL_IF table ix_return
+
+# 将所有直连网段加入 ix_return 表，避免策略路由导致内网流量被误导
+ip -4 route show scope link 2>/dev/null | while IFS= read -r rt; do ip route add \$rt table ix_return 2>/dev/null || true; done
 
 # 恢复内网出站路由表
 ip route flush table internal_out 2>/dev/null || true
@@ -3515,6 +3525,700 @@ rm -f /usr/local/bin/restore-qh-ipv6.sh 2>/dev/null || true
   info "IPv6 传输配置已清理（如有自定义 IPv6 配置，请自行确认）"
 }
 
+# ==================== 内网中转相关函数 ====================
+
+load_relay_config() {
+  if [[ -f "$RELAY_CONFIG_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$RELAY_CONFIG_FILE"
+  fi
+}
+
+save_relay_config() {
+  ensure_state_dir
+  {
+    echo "RELAY_LOCAL_IF=${RELAY_LOCAL_IF}"
+    echo "RELAY_LOCAL_IP=${RELAY_LOCAL_IP}"
+    echo "RELAY_TUNNEL_IF=${RELAY_TUNNEL_IF}"
+    echo "RELAY_REMOTE_IP=${RELAY_REMOTE_IP}"
+    echo "RELAY_REMOTE_EXT_IF=${RELAY_REMOTE_EXT_IF}"
+    echo "RELAY_REMOTE_INT_IF=${RELAY_REMOTE_INT_IF}"
+    echo "RELAY_REMOTE_EXT_GW6=${RELAY_REMOTE_EXT_GW6}"
+  } > "$RELAY_CONFIG_FILE"
+  chmod 600 "$RELAY_CONFIG_FILE"
+}
+
+init_relay_ssh() {
+  QIANHAI_LAN_IP="$RELAY_REMOTE_IP"
+  HK_LAN_IP="$RELAY_LOCAL_IP"
+  BASIC_INFO_READY=1
+  CONFIG_LOADED=1
+  REMOTE_INFO_READY=0
+  info "（以下提示中的 '中国内地端' 即指目标内网机器 $RELAY_REMOTE_IP）"
+  ensure_remote_context || return 1
+}
+
+setup_relay_transit() {
+  ensure_state_dir
+  ensure_packages iproute2 iputils-ping iptables
+
+  info "========================================="
+  info " 内网中转配置"
+  info " 本机将作为中转节点，让内网其他机器经本机到香港"
+  info "========================================="
+
+  load_relay_config
+
+  # ---- 检测本机网卡 ----
+  info "检测本机网卡配置..."
+  echo ""
+  echo "本机检测到的网卡列表:"
+
+  local interfaces_raw
+  interfaces_raw=$(ip link show | grep -E '^[0-9]+:' | awk '{print $2}' | sed 's/:$//' \
+    | grep -v '^lo$' | grep -v '^sit0' \
+    | grep -v "^${SIT_TUNNEL_NAME}$" | grep -v "^${RELAY_SIT_NAME}$")
+  local interfaces=($interfaces_raw)
+  local -a if_ips=()
+
+  for i in "${!interfaces[@]}"; do
+    local if_name="${interfaces[$i]}"
+    local if_ip
+    if_ip=$(ip -o -4 addr show "$if_name" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)
+    if_ips[$i]="$if_ip"
+    local if_ipv6
+    if_ipv6=$(ip -o -6 addr show "$if_name" scope global 2>/dev/null | awk '{print $4}' | head -n1)
+    echo "  $((i+1)). $if_name - IPv4: ${if_ip:-无}  IPv6: ${if_ipv6:-无}"
+  done
+
+  local default_local_if="${RELAY_LOCAL_IF:-}"
+  local default_tunnel_if="${RELAY_TUNNEL_IF:-}"
+  if [[ -z "$default_local_if" ]]; then
+    for i in "${!interfaces[@]}"; do
+      [[ "${if_ips[$i]}" == 10.* ]] && { default_local_if="${interfaces[$i]}"; break; }
+    done
+  fi
+  if [[ -z "$default_tunnel_if" ]]; then
+    for i in "${!interfaces[@]}"; do
+      [[ "${if_ips[$i]}" == 192.168.* ]] && { default_tunnel_if="${interfaces[$i]}"; break; }
+    done
+  fi
+
+  if ! ip link show "$SIT_TUNNEL_NAME" &>/dev/null; then
+    err "未检测到 $SIT_TUNNEL_NAME 隧道，请先确认本机与香港端的SIT隧道已建立"
+    return 1
+  fi
+  info "已检测到 $SIT_TUNNEL_NAME 隧道"
+
+  echo ""
+  local choice
+  read -rp "请选择连接其他内网机器的接口 [${default_local_if:-}]: " choice
+  if [[ -z "$choice" ]]; then
+    RELAY_LOCAL_IF="$default_local_if"
+  elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#interfaces[@]} )); then
+    RELAY_LOCAL_IF="${interfaces[$((choice-1))]}"
+  else
+    RELAY_LOCAL_IF="$choice"
+  fi
+  [[ -z "$RELAY_LOCAL_IF" ]] && { err "未选择内网接口"; return 1; }
+
+  RELAY_LOCAL_IP=$(ip -o -4 addr show "$RELAY_LOCAL_IF" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)
+  [[ -z "$RELAY_LOCAL_IP" ]] && { err "接口 $RELAY_LOCAL_IF 没有IPv4地址"; return 1; }
+  info "内网接口: $RELAY_LOCAL_IF ($RELAY_LOCAL_IP)"
+
+  read -rp "请选择连接香港端的接口 [${default_tunnel_if:-}]: " choice
+  if [[ -z "$choice" ]]; then
+    RELAY_TUNNEL_IF="$default_tunnel_if"
+  elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#interfaces[@]} )); then
+    RELAY_TUNNEL_IF="${interfaces[$((choice-1))]}"
+  else
+    RELAY_TUNNEL_IF="$choice"
+  fi
+  [[ -z "$RELAY_TUNNEL_IF" ]] && { err "未选择香港隧道接口"; return 1; }
+  info "香港隧道接口: $RELAY_TUNNEL_IF"
+
+  local default_remote_ip="${RELAY_REMOTE_IP:-}"
+  local input_ip
+  read -rp "请输入目标内网机器IP${default_remote_ip:+ [$default_remote_ip]}: " input_ip
+  RELAY_REMOTE_IP="${input_ip:-$default_remote_ip}"
+  [[ -z "$RELAY_REMOTE_IP" ]] && { err "目标机器IP不能为空"; return 1; }
+
+  if ! can_ping_ip "$RELAY_REMOTE_IP"; then
+    warn "无法 ping 通 ${RELAY_REMOTE_IP}，请确认内网连通性"
+    local cfm; read -rp "仍要继续吗？[y/N]: " cfm
+    [[ "$cfm" == "y" || "$cfm" == "Y" ]] || return 1
+  fi
+
+  # ---- SSH 连接目标机器 ----
+  if ! init_relay_ssh; then
+    err "无法建立到目标机器的SSH连接"
+    return 1
+  fi
+
+  # ---- 检测目标机器网卡 ----
+  info "获取目标机器网卡配置..."
+  echo ""
+  echo "目标机器检测到的网卡列表:"
+
+  local remote_ifs_raw
+  remote_ifs_raw=$(remote_exec "ip link show | grep -E '^[0-9]+:' | awk '{print \$2}' | sed 's/:$//' \
+    | grep -v '^lo$' | grep -v '^sit0' | grep -v '${RELAY_SIT_NAME}'")
+  local remote_ifs=($remote_ifs_raw)
+  local -a remote_if_ipv4=() remote_if_ipv6=()
+
+  for i in "${!remote_ifs[@]}"; do
+    local rif="${remote_ifs[$i]}"
+    local rip4; rip4=$(remote_exec "ip -o -4 addr show $rif 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -n1")
+    local rip6; rip6=$(remote_exec "ip -o -6 addr show $rif scope global 2>/dev/null | awk '{print \$4}' | head -n1")
+    remote_if_ipv4[$i]="$rip4"
+    remote_if_ipv6[$i]="$rip6"
+    echo "  $((i+1)). $rif - IPv4: ${rip4:-无}  IPv6: ${rip6:-无}"
+  done
+
+  local default_remote_ext="${RELAY_REMOTE_EXT_IF:-}"
+  local default_remote_int="${RELAY_REMOTE_INT_IF:-}"
+  if [[ -z "$default_remote_ext" ]]; then
+    for i in "${!remote_ifs[@]}"; do
+      if [[ -n "${remote_if_ipv6[$i]}" && -z "${remote_if_ipv4[$i]}" ]]; then
+        default_remote_ext="${remote_ifs[$i]}"; break
+      fi
+    done
+    if [[ -z "$default_remote_ext" ]]; then
+      for i in "${!remote_ifs[@]}"; do
+        [[ -n "${remote_if_ipv6[$i]}" ]] && { default_remote_ext="${remote_ifs[$i]}"; break; }
+      done
+    fi
+  fi
+  if [[ -z "$default_remote_int" ]]; then
+    for i in "${!remote_ifs[@]}"; do
+      if [[ "${remote_if_ipv4[$i]}" == 10.* || "${remote_if_ipv4[$i]}" == 192.168.* ]]; then
+        default_remote_int="${remote_ifs[$i]}"; break
+      fi
+    done
+  fi
+
+  echo ""
+  read -rp "请选择目标机器外网接口 [${default_remote_ext:-}]: " choice
+  if [[ -z "$choice" ]]; then
+    RELAY_REMOTE_EXT_IF="$default_remote_ext"
+  elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#remote_ifs[@]} )); then
+    RELAY_REMOTE_EXT_IF="${remote_ifs[$((choice-1))]}"
+  else
+    RELAY_REMOTE_EXT_IF="$choice"
+  fi
+
+  read -rp "请选择目标机器内网接口 [${default_remote_int:-}]: " choice
+  if [[ -z "$choice" ]]; then
+    RELAY_REMOTE_INT_IF="$default_remote_int"
+  elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#remote_ifs[@]} )); then
+    RELAY_REMOTE_INT_IF="${remote_ifs[$((choice-1))]}"
+  else
+    RELAY_REMOTE_INT_IF="$choice"
+  fi
+
+  [[ -z "$RELAY_REMOTE_EXT_IF" || -z "$RELAY_REMOTE_INT_IF" ]] && {
+    err "请选择目标机器的外网和内网接口"; return 1
+  }
+
+  RELAY_REMOTE_EXT_GW6=$(remote_exec "ip -6 route show default dev $RELAY_REMOTE_EXT_IF 2>/dev/null | awk '/via/ {print \$3; exit}'")
+  if [[ -z "$RELAY_REMOTE_EXT_GW6" ]]; then
+    RELAY_REMOTE_EXT_GW6=$(remote_exec "ip -6 route show default 2>/dev/null | awk '/via/ {print \$3; exit}'")
+  fi
+  info "目标机器外网接口: $RELAY_REMOTE_EXT_IF (IPv6网关: ${RELAY_REMOTE_EXT_GW6:-未检测到})"
+  info "目标机器内网接口: $RELAY_REMOTE_INT_IF"
+
+  local relay_remote_ext_ips6
+  relay_remote_ext_ips6=$(remote_exec "ip -o -6 addr show $RELAY_REMOTE_EXT_IF scope global 2>/dev/null | awk '{print \$4}' | cut -d/ -f1")
+
+  save_relay_config
+
+  # ==== Phase 1: 配置本机（中转节点） ====
+  info ""
+  info "===== 配置本机中转规则 ====="
+
+  info "启用IP转发..."
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null
+  sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null
+  [[ -f /etc/sysctl.conf ]] || touch /etc/sysctl.conf
+  grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf || echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+  grep -q "^net.ipv6.conf.all.forwarding=1" /etc/sysctl.conf || echo "net.ipv6.conf.all.forwarding=1" >> /etc/sysctl.conf
+  sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null
+  sysctl -w "net.ipv4.conf.${RELAY_LOCAL_IF}.rp_filter=2" >/dev/null
+  sysctl -w "net.ipv4.conf.${RELAY_TUNNEL_IF}.rp_filter=2" >/dev/null
+
+  info "配置IPv4转发和NAT..."
+  local relay_cidr
+  relay_cidr=$(ip -o -4 addr show "$RELAY_LOCAL_IF" | awk '{print $4}' | head -n1)
+
+  iptables -D FORWARD -i "$RELAY_LOCAL_IF" -o "$RELAY_TUNNEL_IF" -j ACCEPT 2>/dev/null || true
+  iptables -D FORWARD -i "$RELAY_TUNNEL_IF" -o "$RELAY_LOCAL_IF" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+  iptables -t nat -D POSTROUTING -s "$relay_cidr" -o "$RELAY_TUNNEL_IF" -j MASQUERADE 2>/dev/null || true
+
+  iptables -I FORWARD 1 -i "$RELAY_LOCAL_IF" -o "$RELAY_TUNNEL_IF" -j ACCEPT
+  iptables -I FORWARD 2 -i "$RELAY_TUNNEL_IF" -o "$RELAY_LOCAL_IF" -m state --state RELATED,ESTABLISHED -j ACCEPT
+  iptables -t nat -A POSTROUTING -s "$relay_cidr" -o "$RELAY_TUNNEL_IF" -j MASQUERADE
+
+  local local_ula="${RELAY_ULA_PREFIX}1"
+  local remote_ula="${RELAY_ULA_PREFIX}2"
+
+  info "创建SIT中转隧道 $RELAY_SIT_NAME ($RELAY_LOCAL_IP <-> $RELAY_REMOTE_IP)..."
+  ip tunnel del "$RELAY_SIT_NAME" 2>/dev/null || true
+  ip tunnel add "$RELAY_SIT_NAME" mode sit remote "$RELAY_REMOTE_IP" local "$RELAY_LOCAL_IP" ttl 255
+  ip link set "$RELAY_SIT_NAME" up
+  ip -6 addr add "${local_ula}/64" dev "$RELAY_SIT_NAME" 2>/dev/null || true
+
+  info "配置IPv6转发和NAT66..."
+  local local_use_nft=0
+  if command -v nft >/dev/null 2>&1; then
+    local_use_nft=1
+    nft delete table ip6 relay_nat66 >/dev/null 2>&1 || true
+    nft -f - <<NFT6
+table ip6 relay_nat66 {
+  chain forward {
+    type filter hook forward priority 0; policy accept;
+    iifname "$RELAY_SIT_NAME" oifname "$SIT_TUNNEL_NAME" accept
+    iifname "$SIT_TUNNEL_NAME" oifname "$RELAY_SIT_NAME" ct state related,established accept
+  }
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+    iifname "$RELAY_SIT_NAME" oifname "$SIT_TUNNEL_NAME" masquerade
+  }
+}
+NFT6
+  elif command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -D FORWARD -i "$RELAY_SIT_NAME" -o "$SIT_TUNNEL_NAME" -j ACCEPT 2>/dev/null || true
+    ip6tables -D FORWARD -i "$SIT_TUNNEL_NAME" -o "$RELAY_SIT_NAME" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+    ip6tables -t nat -D POSTROUTING -o "$SIT_TUNNEL_NAME" -s "${RELAY_ULA_PREFIX}/64" -j MASQUERADE 2>/dev/null || true
+    ip6tables -I FORWARD 1 -i "$RELAY_SIT_NAME" -o "$SIT_TUNNEL_NAME" -j ACCEPT
+    ip6tables -I FORWARD 2 -i "$SIT_TUNNEL_NAME" -o "$RELAY_SIT_NAME" -m state --state RELATED,ESTABLISHED -j ACCEPT
+    ip6tables -t nat -A POSTROUTING -o "$SIT_TUNNEL_NAME" -s "${RELAY_ULA_PREFIX}/64" -j MASQUERADE
+  else
+    warn "未检测到 nft 或 ip6tables，IPv6中转将不可用"
+  fi
+
+  mkdir -p /etc/iptables
+  iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+  ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+
+  info "创建本机持久化脚本..."
+  cat > /usr/local/bin/restore-relay-transit.sh << RELAY_LOCAL_EOF
+#!/bin/bash
+sleep 10
+
+sysctl -w net.ipv4.ip_forward=1 >/dev/null
+sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null
+sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null
+sysctl -w net.ipv4.conf.${RELAY_LOCAL_IF}.rp_filter=2 >/dev/null
+sysctl -w net.ipv4.conf.${RELAY_TUNNEL_IF}.rp_filter=2 >/dev/null
+
+iptables -D FORWARD -i "${RELAY_LOCAL_IF}" -o "${RELAY_TUNNEL_IF}" -j ACCEPT 2>/dev/null || true
+iptables -D FORWARD -i "${RELAY_TUNNEL_IF}" -o "${RELAY_LOCAL_IF}" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+iptables -t nat -D POSTROUTING -s "${relay_cidr}" -o "${RELAY_TUNNEL_IF}" -j MASQUERADE 2>/dev/null || true
+iptables -I FORWARD 1 -i "${RELAY_LOCAL_IF}" -o "${RELAY_TUNNEL_IF}" -j ACCEPT
+iptables -I FORWARD 2 -i "${RELAY_TUNNEL_IF}" -o "${RELAY_LOCAL_IF}" -m state --state RELATED,ESTABLISHED -j ACCEPT
+iptables -t nat -A POSTROUTING -s "${relay_cidr}" -o "${RELAY_TUNNEL_IF}" -j MASQUERADE
+
+ip tunnel del "${RELAY_SIT_NAME}" 2>/dev/null || true
+ip tunnel add "${RELAY_SIT_NAME}" mode sit remote "${RELAY_REMOTE_IP}" local "${RELAY_LOCAL_IP}" ttl 255
+ip link set "${RELAY_SIT_NAME}" up
+ip -6 addr add "${local_ula}/64" dev "${RELAY_SIT_NAME}" 2>/dev/null || true
+
+if [ ${local_use_nft} -eq 1 ] && command -v nft >/dev/null 2>&1; then
+  nft delete table ip6 relay_nat66 >/dev/null 2>&1 || true
+  nft add table ip6 relay_nat66
+  nft 'add chain ip6 relay_nat66 forward { type filter hook forward priority 0; policy accept; }'
+  nft add rule ip6 relay_nat66 forward iifname "${RELAY_SIT_NAME}" oifname "${SIT_TUNNEL_NAME}" accept
+  nft add rule ip6 relay_nat66 forward iifname "${SIT_TUNNEL_NAME}" oifname "${RELAY_SIT_NAME}" ct state related,established accept
+  nft 'add chain ip6 relay_nat66 postrouting { type nat hook postrouting priority srcnat; policy accept; }'
+  nft add rule ip6 relay_nat66 postrouting iifname "${RELAY_SIT_NAME}" oifname "${SIT_TUNNEL_NAME}" masquerade
+elif command -v ip6tables >/dev/null 2>&1; then
+  ip6tables -D FORWARD -i "${RELAY_SIT_NAME}" -o "${SIT_TUNNEL_NAME}" -j ACCEPT 2>/dev/null || true
+  ip6tables -D FORWARD -i "${SIT_TUNNEL_NAME}" -o "${RELAY_SIT_NAME}" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+  ip6tables -t nat -D POSTROUTING -o "${SIT_TUNNEL_NAME}" -s "${RELAY_ULA_PREFIX}/64" -j MASQUERADE 2>/dev/null || true
+  ip6tables -I FORWARD 1 -i "${RELAY_SIT_NAME}" -o "${SIT_TUNNEL_NAME}" -j ACCEPT
+  ip6tables -I FORWARD 2 -i "${SIT_TUNNEL_NAME}" -o "${RELAY_SIT_NAME}" -m state --state RELATED,ESTABLISHED -j ACCEPT
+  ip6tables -t nat -A POSTROUTING -o "${SIT_TUNNEL_NAME}" -s "${RELAY_ULA_PREFIX}/64" -j MASQUERADE
+fi
+
+logger -t restore-relay 'Relay transit configuration restored'
+RELAY_LOCAL_EOF
+  chmod +x /usr/local/bin/restore-relay-transit.sh
+
+  cat > /etc/systemd/system/relay-transit-restore.service << 'RELAY_SVC_EOF'
+[Unit]
+Description=Restore Relay Transit Configuration
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/restore-relay-transit.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+RELAY_SVC_EOF
+
+  systemctl daemon-reload
+  systemctl enable relay-transit-restore.service
+  info "本机中转规则配置完成"
+
+  # ==== Phase 2: 配置目标机器 ====
+  info ""
+  info "===== 配置目标机器 ====="
+
+  local m2_is_debian=0
+  if remote_exec "test -f /etc/debian_version"; then
+    m2_is_debian=1
+  fi
+  if (( m2_is_debian )); then
+    info "检测到 Debian 自动 apt upgrade 服务"
+    local dau_choice
+    read -rp "是否禁用目标机器的自动 apt upgrade 服务？[Y/n]: " dau_choice
+    if [[ "$dau_choice" != "n" && "$dau_choice" != "N" ]]; then
+      disable_remote_auto_upgrade || warn "禁用自动 apt upgrade 服务失败"
+    fi
+  fi
+
+  info "在目标机器创建SIT中转隧道..."
+  remote_sudo "ip tunnel del '$RELAY_SIT_NAME' 2>/dev/null || true
+ip tunnel add '$RELAY_SIT_NAME' mode sit remote '$RELAY_LOCAL_IP' local '$RELAY_REMOTE_IP' ttl 255
+ip link set '$RELAY_SIT_NAME' up
+ip -6 addr add '${remote_ula}/64' dev '$RELAY_SIT_NAME' 2>/dev/null || true"
+
+  info "保存目标机器原始路由..."
+  remote_exec "ip route show default > ~/.relay_original_route 2>/dev/null || true"
+  remote_exec "ip -6 route show default > ~/.relay_original_route6 2>/dev/null || true"
+
+  info "设置目标机器IPv4默认路由..."
+  remote_sudo "ip route del default 2>/dev/null || true
+ip route add default via $RELAY_LOCAL_IP dev $RELAY_REMOTE_INT_IF"
+
+  info "配置目标机器策略路由..."
+  remote_sudo "mkdir -p /etc/iproute2 && test -f /etc/iproute2/rt_tables || cat > /etc/iproute2/rt_tables << 'RTEOF'
+#
+# reserved values
+#
+255	local
+254	main
+253	default
+0	unspec
+RTEOF"
+  remote_sudo "grep -q 'relay_return' /etc/iproute2/rt_tables 2>/dev/null || echo '200 relay_return' >> /etc/iproute2/rt_tables"
+
+  remote_sudo "ip -6 route flush table relay_return 2>/dev/null || true"
+  if [[ -n "$RELAY_REMOTE_EXT_GW6" ]]; then
+    remote_sudo "ip -6 route add default via $RELAY_REMOTE_EXT_GW6 dev $RELAY_REMOTE_EXT_IF table relay_return"
+  fi
+
+  local ip6_addr
+  while IFS= read -r ip6_addr; do
+    [[ -z "$ip6_addr" ]] && continue
+    remote_sudo "ip -6 rule del from $ip6_addr table relay_return 2>/dev/null || true"
+    remote_sudo "ip -6 rule add from $ip6_addr table relay_return priority 100"
+  done <<< "$relay_remote_ext_ips6"
+
+  info "配置SSH直连端口标记..."
+  local ssh_ports_nft="${SSH_DIRECT_PORTS// /, }"
+  local remote_use_nft=0
+  if remote_exec "command -v nft >/dev/null 2>&1"; then
+    remote_use_nft=1
+  fi
+
+  if (( remote_use_nft )); then
+    remote_sudo "nft delete table inet relay_mark >/dev/null 2>&1 || true"
+    remote_sudo "nft add table inet relay_mark"
+    remote_sudo "nft 'add chain inet relay_mark prerouting { type filter hook prerouting priority -150; policy accept; }'"
+    remote_sudo "nft 'add chain inet relay_mark output { type route hook output priority -150; policy accept; }'"
+    remote_sudo "nft \"add rule inet relay_mark prerouting iif $RELAY_REMOTE_EXT_IF ct mark set $ROUTE_MARK\""
+    remote_sudo "nft 'add rule inet relay_mark output meta mark set ct mark'"
+    remote_sudo "nft 'add rule inet relay_mark output tcp sport { $ssh_ports_nft } meta mark set $SSH_DIRECT_MARK'"
+    remote_sudo "nft 'add rule inet relay_mark output tcp dport { $ssh_ports_nft } meta mark set $SSH_DIRECT_MARK'"
+  elif remote_exec "command -v ip6tables >/dev/null 2>&1"; then
+    remote_sudo "ip6tables -t mangle -D PREROUTING -i $RELAY_REMOTE_EXT_IF -j CONNMARK --set-mark $ROUTE_MARK 2>/dev/null || true"
+    remote_sudo "ip6tables -t mangle -D OUTPUT -j CONNMARK --restore-mark 2>/dev/null || true"
+    remote_sudo "for p in $SSH_DIRECT_PORTS; do ip6tables -t mangle -D OUTPUT -p tcp --sport \$p -j MARK --set-mark $SSH_DIRECT_MARK 2>/dev/null || true; ip6tables -t mangle -D OUTPUT -p tcp --dport \$p -j MARK --set-mark $SSH_DIRECT_MARK 2>/dev/null || true; done"
+    remote_sudo "ip6tables -t mangle -A PREROUTING -i $RELAY_REMOTE_EXT_IF -j CONNMARK --set-mark $ROUTE_MARK"
+    remote_sudo "ip6tables -t mangle -A OUTPUT -j CONNMARK --restore-mark"
+    remote_sudo "for p in $SSH_DIRECT_PORTS; do ip6tables -t mangle -A OUTPUT -p tcp --sport \$p -j MARK --set-mark $SSH_DIRECT_MARK; ip6tables -t mangle -A OUTPUT -p tcp --dport \$p -j MARK --set-mark $SSH_DIRECT_MARK; done"
+  fi
+
+  remote_sudo "ip -6 rule del fwmark $SSH_DIRECT_MARK table relay_return 2>/dev/null || true"
+  remote_sudo "ip -6 rule add fwmark $SSH_DIRECT_MARK table relay_return priority 98"
+  remote_sudo "ip -6 rule del fwmark $ROUTE_MARK table relay_return 2>/dev/null || true"
+  remote_sudo "ip -6 rule add fwmark $ROUTE_MARK table relay_return priority 99"
+
+  info "设置目标机器IPv6默认路由走中转隧道..."
+  remote_sudo "ip -6 route del default 2>/dev/null || true"
+  remote_sudo "ip -6 route add default via $local_ula dev $RELAY_SIT_NAME"
+
+  remote_sudo "sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true"
+  remote_sudo "sysctl -w net.ipv6.conf.$RELAY_REMOTE_EXT_IF.forwarding=1 >/dev/null 2>&1 || true"
+  remote_sudo "sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null 2>&1 || true"
+  remote_sudo "sysctl -w net.ipv4.conf.$RELAY_REMOTE_INT_IF.rp_filter=2 >/dev/null 2>&1 || true"
+
+  info "配置DNS..."
+  if update_remote_dns_servers "8.8.8.8" "1.1.1.1"; then
+    info "DNS已更新"
+  else
+    warn "DNS配置失败，请手动确认"
+  fi
+
+  if (( remote_use_nft )); then
+    remote_sudo "if [ -w /etc/nftables.conf ]; then nft list ruleset > /etc/nftables.conf; elif command -v netfilter-persistent >/dev/null 2>&1; then netfilter-persistent save; fi" >/dev/null 2>&1 || true
+  else
+    remote_sudo "mkdir -p /etc/iptables; ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true"
+  fi
+
+  info "创建目标机器持久化脚本..."
+  local ipv6_addrs_for_script=""
+  while IFS= read -r ip6_addr; do
+    [[ -z "$ip6_addr" ]] && continue
+    ipv6_addrs_for_script="${ipv6_addrs_for_script}${ip6_addr} "
+  done <<< "$relay_remote_ext_ips6"
+
+  remote_sudo "cat > /usr/local/bin/restore-relay-client.sh << 'RCEOF'
+#!/bin/bash
+sleep 10
+
+ip tunnel del $RELAY_SIT_NAME 2>/dev/null || true
+ip tunnel add $RELAY_SIT_NAME mode sit remote $RELAY_LOCAL_IP local $RELAY_REMOTE_IP ttl 255
+ip link set $RELAY_SIT_NAME up
+ip -6 addr add ${remote_ula}/64 dev $RELAY_SIT_NAME 2>/dev/null || true
+
+grep -q 'relay_return' /etc/iproute2/rt_tables 2>/dev/null || echo '200 relay_return' >> /etc/iproute2/rt_tables
+
+ip route del default 2>/dev/null || true
+ip route add default via $RELAY_LOCAL_IP dev $RELAY_REMOTE_INT_IF
+
+ip -6 route flush table relay_return 2>/dev/null || true
+ip -6 route add default via $RELAY_REMOTE_EXT_GW6 dev $RELAY_REMOTE_EXT_IF table relay_return 2>/dev/null || true
+
+for addr in $ipv6_addrs_for_script; do
+  ip -6 rule del from \$addr table relay_return 2>/dev/null || true
+  ip -6 rule add from \$addr table relay_return priority 100
+done
+
+ip -6 rule del fwmark $SSH_DIRECT_MARK table relay_return 2>/dev/null || true
+ip -6 rule add fwmark $SSH_DIRECT_MARK table relay_return priority 98
+ip -6 rule del fwmark $ROUTE_MARK table relay_return 2>/dev/null || true
+ip -6 rule add fwmark $ROUTE_MARK table relay_return priority 99
+
+ip -6 route del default 2>/dev/null || true
+ip -6 route add default via $local_ula dev $RELAY_SIT_NAME
+
+SSH_DIRECT_PORTS='$SSH_DIRECT_PORTS'
+SSH_PORTS_NFT=\${SSH_DIRECT_PORTS// /, }
+
+if [ $remote_use_nft -eq 1 ] && command -v nft >/dev/null 2>&1; then
+  nft delete table inet relay_mark >/dev/null 2>&1 || true
+  nft add table inet relay_mark
+  nft 'add chain inet relay_mark prerouting { type filter hook prerouting priority -150; policy accept; }'
+  nft 'add chain inet relay_mark output { type route hook output priority -150; policy accept; }'
+  nft \"add rule inet relay_mark prerouting iif $RELAY_REMOTE_EXT_IF ct mark set $ROUTE_MARK\"
+  nft 'add rule inet relay_mark output meta mark set ct mark'
+  nft \"add rule inet relay_mark output tcp sport { \$SSH_PORTS_NFT } meta mark set $SSH_DIRECT_MARK\"
+  nft \"add rule inet relay_mark output tcp dport { \$SSH_PORTS_NFT } meta mark set $SSH_DIRECT_MARK\"
+elif command -v ip6tables >/dev/null 2>&1; then
+  ip6tables -t mangle -D PREROUTING -i $RELAY_REMOTE_EXT_IF -j CONNMARK --set-mark $ROUTE_MARK 2>/dev/null || true
+  ip6tables -t mangle -D OUTPUT -j CONNMARK --restore-mark 2>/dev/null || true
+  for p in \$SSH_DIRECT_PORTS; do
+    ip6tables -t mangle -D OUTPUT -p tcp --sport \$p -j MARK --set-mark $SSH_DIRECT_MARK 2>/dev/null || true
+    ip6tables -t mangle -D OUTPUT -p tcp --dport \$p -j MARK --set-mark $SSH_DIRECT_MARK 2>/dev/null || true
+  done
+  ip6tables -t mangle -A PREROUTING -i $RELAY_REMOTE_EXT_IF -j CONNMARK --set-mark $ROUTE_MARK
+  ip6tables -t mangle -A OUTPUT -j CONNMARK --restore-mark
+  for p in \$SSH_DIRECT_PORTS; do
+    ip6tables -t mangle -A OUTPUT -p tcp --sport \$p -j MARK --set-mark $SSH_DIRECT_MARK
+    ip6tables -t mangle -A OUTPUT -p tcp --dport \$p -j MARK --set-mark $SSH_DIRECT_MARK
+  done
+fi
+
+sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
+sysctl -w net.ipv6.conf.$RELAY_REMOTE_EXT_IF.forwarding=1 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.conf.$RELAY_REMOTE_INT_IF.rp_filter=2 >/dev/null 2>&1 || true
+
+logger -t restore-relay-client 'Relay client configuration restored'
+RCEOF"
+
+  remote_sudo "chmod +x /usr/local/bin/restore-relay-client.sh"
+
+  remote_sudo "cat > /etc/systemd/system/relay-client-restore.service << 'RCSVCEOF'
+[Unit]
+Description=Restore Relay Client Configuration
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/restore-relay-client.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+RCSVCEOF"
+
+  remote_sudo "systemctl daemon-reload"
+  remote_sudo "systemctl enable relay-client-restore.service"
+
+  write_local_flag "$RELAY_FLAG"
+  write_local_flag "$RELAY_META" \
+    "relay_local_if=$RELAY_LOCAL_IF" \
+    "relay_local_ip=$RELAY_LOCAL_IP" \
+    "relay_tunnel_if=$RELAY_TUNNEL_IF" \
+    "relay_remote_ip=$RELAY_REMOTE_IP" \
+    "relay_remote_ext_if=$RELAY_REMOTE_EXT_IF" \
+    "relay_remote_int_if=$RELAY_REMOTE_INT_IF"
+
+  mark_action "relay_setup" "中转配置完成: $RELAY_LOCAL_IP <-> $RELAY_REMOTE_IP"
+
+  BASIC_INFO_READY=0
+  CONFIG_LOADED=0
+  REMOTE_INFO_READY=0
+
+  info ""
+  info "========================================="
+  info " 内网中转配置完成！"
+  info "========================================="
+  info "中转节点(本机): $RELAY_LOCAL_IF ($RELAY_LOCAL_IP)"
+  info "目标机器: $RELAY_REMOTE_IP"
+  info "  外网: $RELAY_REMOTE_EXT_IF (IPv6)"
+  info "  内网: $RELAY_REMOTE_INT_IF"
+  info "IPv4: 目标→本机($RELAY_LOCAL_IP)→$RELAY_TUNNEL_IF→香港"
+  info "IPv6: 目标→SIT中转隧道→本机→SIT香港隧道→香港"
+  info "SSH端口($SSH_DIRECT_PORTS)保持目标机器本地IPv6出口"
+  info "========================================="
+}
+
+clear_relay_transit() {
+  ensure_state_dir
+
+  if [[ ! -f "$RELAY_CONFIG_FILE" ]]; then
+    err "未找到中转配置文件 $RELAY_CONFIG_FILE，可能未配置过中转"
+    return 1
+  fi
+
+  load_relay_config
+
+  if [[ -z "$RELAY_REMOTE_IP" || -z "$RELAY_LOCAL_IF" ]]; then
+    err "中转配置信息不完整"
+    return 1
+  fi
+
+  info "========================================="
+  info " 取消内网中转配置"
+  info " 中转节点: $RELAY_LOCAL_IP → 目标: $RELAY_REMOTE_IP"
+  info "========================================="
+
+  local remote_ok=0
+  if init_relay_ssh; then
+    remote_ok=1
+  else
+    warn "无法连接目标机器，将仅清理本机配置"
+  fi
+
+  if (( remote_ok )); then
+    info "===== 清理目标机器配置 ====="
+
+    remote_sudo "nft delete table inet relay_mark >/dev/null 2>&1 || true"
+    if remote_exec "command -v ip6tables >/dev/null 2>&1"; then
+      remote_sudo "ip6tables -t mangle -D PREROUTING -i $RELAY_REMOTE_EXT_IF -j CONNMARK --set-mark $ROUTE_MARK 2>/dev/null || true"
+      remote_sudo "ip6tables -t mangle -D OUTPUT -j CONNMARK --restore-mark 2>/dev/null || true"
+      remote_sudo "for p in $SSH_DIRECT_PORTS; do ip6tables -t mangle -D OUTPUT -p tcp --sport \$p -j MARK --set-mark $SSH_DIRECT_MARK 2>/dev/null || true; ip6tables -t mangle -D OUTPUT -p tcp --dport \$p -j MARK --set-mark $SSH_DIRECT_MARK 2>/dev/null || true; done"
+    fi
+
+    remote_sudo "while ip -6 rule del table relay_return 2>/dev/null; do :; done"
+    remote_sudo "ip -6 route flush table relay_return 2>/dev/null || true"
+
+    if remote_exec "test -f ~/.relay_original_route6"; then
+      local saved_route6
+      saved_route6=$(remote_exec "cat ~/.relay_original_route6 2>/dev/null | head -n1")
+      if [[ -n "$saved_route6" ]]; then
+        remote_sudo "ip -6 route del default 2>/dev/null || true"
+        remote_sudo "ip -6 route add $saved_route6 2>/dev/null || true"
+      fi
+      remote_exec "rm -f ~/.relay_original_route6"
+    else
+      remote_sudo "ip -6 route del default 2>/dev/null || true"
+      if [[ -n "$RELAY_REMOTE_EXT_GW6" ]]; then
+        remote_sudo "ip -6 route add default via $RELAY_REMOTE_EXT_GW6 dev $RELAY_REMOTE_EXT_IF 2>/dev/null || true"
+      fi
+    fi
+
+    if remote_exec "test -f ~/.relay_original_route"; then
+      local saved_route4
+      saved_route4=$(remote_exec "cat ~/.relay_original_route 2>/dev/null | head -n1")
+      if [[ -n "$saved_route4" ]]; then
+        remote_sudo "ip route del default 2>/dev/null || true"
+        remote_sudo "ip route add $saved_route4 2>/dev/null || true"
+      fi
+      remote_exec "rm -f ~/.relay_original_route"
+    else
+      remote_sudo "ip route del default via $RELAY_LOCAL_IP 2>/dev/null || true"
+    fi
+
+    remote_sudo "ip tunnel del '$RELAY_SIT_NAME' 2>/dev/null || true"
+
+    remote_sudo "systemctl disable relay-client-restore.service 2>/dev/null || true"
+    remote_sudo "systemctl stop relay-client-restore.service 2>/dev/null || true"
+    remote_sudo "rm -f /etc/systemd/system/relay-client-restore.service"
+    remote_sudo "rm -f /usr/local/bin/restore-relay-client.sh"
+    remote_sudo "systemctl daemon-reload 2>/dev/null || true"
+
+    if remote_exec "test -f $AUTO_UPGRADE_STATE_FILE"; then
+      info "恢复目标机器自动 apt upgrade 服务..."
+      restore_remote_auto_upgrade || warn "恢复自动 apt upgrade 失败"
+    fi
+
+    remote_sudo "mkdir -p /etc/iptables; ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true"
+    info "目标机器配置已清理"
+  fi
+
+  info "===== 清理本机中转配置 ====="
+
+  local relay_cidr
+  relay_cidr=$(ip -o -4 addr show "$RELAY_LOCAL_IF" 2>/dev/null | awk '{print $4}' | head -n1)
+
+  iptables -D FORWARD -i "$RELAY_LOCAL_IF" -o "$RELAY_TUNNEL_IF" -j ACCEPT 2>/dev/null || true
+  iptables -D FORWARD -i "$RELAY_TUNNEL_IF" -o "$RELAY_LOCAL_IF" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+  if [[ -n "$relay_cidr" ]]; then
+    iptables -t nat -D POSTROUTING -s "$relay_cidr" -o "$RELAY_TUNNEL_IF" -j MASQUERADE 2>/dev/null || true
+  fi
+
+  nft delete table ip6 relay_nat66 >/dev/null 2>&1 || true
+  if command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -D FORWARD -i "$RELAY_SIT_NAME" -o "$SIT_TUNNEL_NAME" -j ACCEPT 2>/dev/null || true
+    ip6tables -D FORWARD -i "$SIT_TUNNEL_NAME" -o "$RELAY_SIT_NAME" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+    ip6tables -t nat -D POSTROUTING -o "$SIT_TUNNEL_NAME" -s "${RELAY_ULA_PREFIX}/64" -j MASQUERADE 2>/dev/null || true
+  fi
+
+  ip tunnel del "$RELAY_SIT_NAME" 2>/dev/null || true
+
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl disable relay-transit-restore.service 2>/dev/null || true
+    systemctl stop relay-transit-restore.service 2>/dev/null || true
+    rm -f /etc/systemd/system/relay-transit-restore.service
+    systemctl daemon-reload 2>/dev/null || true
+  fi
+  rm -f /usr/local/bin/restore-relay-transit.sh
+
+  mkdir -p /etc/iptables
+  iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+  ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+
+  clear_state_flag "$RELAY_FLAG"
+  rm -f "$RELAY_META" "$RELAY_CONFIG_FILE"
+  mark_action "relay_clear" "中转配置已清除"
+
+  BASIC_INFO_READY=0
+  CONFIG_LOADED=0
+  REMOTE_INFO_READY=0
+
+  info ""
+  info "内网中转配置已完全清除"
+}
+
 # ==================== 菜单函数 ====================
 show_proxy_menu() {
   cat <<'MENU'
@@ -3545,6 +4249,8 @@ show_route_menu() {
 6) 恢复中国内地端默认路由
 7) 配置IPv6传输（SIT隧道）
 8) 取消IPv6传输（SIT隧道）
+9) 配置内网中转（让内网其他机器经本机到香港）
+10) 取消内网中转
 b) 返回模式选择
 q) 退出
 MENU
@@ -3967,6 +4673,8 @@ main() {
           6) run_menu_action "恢复中国内地端默认路由" restore_qh_default_route ;;
           7) run_menu_action "配置IPv6传输（SIT隧道）" setup_ipv6_transport ;;
           8) run_menu_action "取消IPv6传输（SIT隧道）" clear_ipv6_transport ;;
+          9) run_menu_action "配置内网中转" setup_relay_transit ;;
+          10) run_menu_action "取消内网中转" clear_relay_transit ;;
           b|B)
             break
             ;;
