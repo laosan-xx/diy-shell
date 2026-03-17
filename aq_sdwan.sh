@@ -3933,14 +3933,13 @@ RTEOF"
     remote_sudo "nft \"add rule inet relay_mark prerouting iif $RELAY_REMOTE_EXT_IF ct mark set $ROUTE_MARK\""
     remote_sudo "nft 'add rule inet relay_mark output meta mark set ct mark'"
     remote_sudo "nft 'add rule inet relay_mark output tcp sport { $ssh_ports_nft } meta mark set $SSH_DIRECT_MARK'"
-    remote_sudo "nft 'add rule inet relay_mark output tcp dport { $ssh_ports_nft } meta mark set $SSH_DIRECT_MARK'"
   elif remote_exec "command -v ip6tables >/dev/null 2>&1"; then
     remote_sudo "ip6tables -t mangle -D PREROUTING -i $RELAY_REMOTE_EXT_IF -j CONNMARK --set-mark $ROUTE_MARK 2>/dev/null || true"
     remote_sudo "ip6tables -t mangle -D OUTPUT -j CONNMARK --restore-mark 2>/dev/null || true"
     remote_sudo "for p in $SSH_DIRECT_PORTS; do ip6tables -t mangle -D OUTPUT -p tcp --sport \$p -j MARK --set-mark $SSH_DIRECT_MARK 2>/dev/null || true; ip6tables -t mangle -D OUTPUT -p tcp --dport \$p -j MARK --set-mark $SSH_DIRECT_MARK 2>/dev/null || true; done"
     remote_sudo "ip6tables -t mangle -A PREROUTING -i $RELAY_REMOTE_EXT_IF -j CONNMARK --set-mark $ROUTE_MARK"
     remote_sudo "ip6tables -t mangle -A OUTPUT -j CONNMARK --restore-mark"
-    remote_sudo "for p in $SSH_DIRECT_PORTS; do ip6tables -t mangle -A OUTPUT -p tcp --sport \$p -j MARK --set-mark $SSH_DIRECT_MARK; ip6tables -t mangle -A OUTPUT -p tcp --dport \$p -j MARK --set-mark $SSH_DIRECT_MARK; done"
+    remote_sudo "for p in $SSH_DIRECT_PORTS; do ip6tables -t mangle -A OUTPUT -p tcp --sport \$p -j MARK --set-mark $SSH_DIRECT_MARK; done"
   fi
 
   remote_sudo "ip -6 rule del fwmark $SSH_DIRECT_MARK table relay_return 2>/dev/null || true"
@@ -4018,7 +4017,6 @@ if [ $remote_use_nft -eq 1 ] && command -v nft >/dev/null 2>&1; then
   nft \"add rule inet relay_mark prerouting iif $RELAY_REMOTE_EXT_IF ct mark set $ROUTE_MARK\"
   nft 'add rule inet relay_mark output meta mark set ct mark'
   nft \"add rule inet relay_mark output tcp sport { \$SSH_PORTS_NFT } meta mark set $SSH_DIRECT_MARK\"
-  nft \"add rule inet relay_mark output tcp dport { \$SSH_PORTS_NFT } meta mark set $SSH_DIRECT_MARK\"
 elif command -v ip6tables >/dev/null 2>&1; then
   ip6tables -t mangle -D PREROUTING -i $RELAY_REMOTE_EXT_IF -j CONNMARK --set-mark $ROUTE_MARK 2>/dev/null || true
   ip6tables -t mangle -D OUTPUT -j CONNMARK --restore-mark 2>/dev/null || true
@@ -4030,7 +4028,6 @@ elif command -v ip6tables >/dev/null 2>&1; then
   ip6tables -t mangle -A OUTPUT -j CONNMARK --restore-mark
   for p in \$SSH_DIRECT_PORTS; do
     ip6tables -t mangle -A OUTPUT -p tcp --sport \$p -j MARK --set-mark $SSH_DIRECT_MARK
-    ip6tables -t mangle -A OUTPUT -p tcp --dport \$p -j MARK --set-mark $SSH_DIRECT_MARK
   done
 fi
 
