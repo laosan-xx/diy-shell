@@ -28,6 +28,15 @@ SSH_DIRECT_MARK="110"
 SSH_DIRECT_PORTS="22 2345"
 AUTO_UPGRADE_STATE_FILE="/etc/qh_auto_upgrade_state"
 
+# 直连域名（绕过隧道）相关
+TCPING_DIRECT_LIST="/etc/tcping-direct-list.conf"
+TCPING_DNSMASQ_CONF="/etc/dnsmasq.d/tcping-direct.conf"
+TCPING_IPSET_NAME="tcping_direct"
+TCPING_IPSET_NAME6="tcping_direct6"
+TCPING_RESOLVER_SCRIPT="/usr/local/bin/tcping-direct-resolve.sh"
+TCPING_DNSMASQ_UPSTREAM="server=8.8.8.8
+server=1.1.1.1"
+
 # 状态变量
 BASIC_INFO_READY=0
 REMOTE_INFO_READY=0
@@ -99,7 +108,7 @@ load_saved_config() {
   fi
   if [[ -f "$CONFIG_FILE" ]]; then
     # shellcheck disable=SC1090
-    source "$CONFIG_FILE"
+    source "$CONFIG_FILE" 2>/dev/null || true
   fi
   CONFIG_LOADED=1
 }
@@ -4216,6 +4225,676 @@ clear_relay_transit() {
   info "内网中转配置已完全清除"
 }
 
+# ==================== 直连域名管理（绕过隧道） ====================
+tcping_direct_detect_nft() {
+  remote_exec "command -v nft >/dev/null 2>&1" && echo 1 || echo 0
+}
+
+tcping_direct_find_nft_table() {
+  local table
+  for table in qh_mark relay_mark; do
+    if remote_exec "nft list table inet $table >/dev/null 2>&1"; then
+      echo "$table"; return 0
+    fi
+  done
+  echo ""; return 1
+}
+
+tcping_direct_is_ipv4() {
+  [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]
+}
+
+tcping_direct_is_ipv6() {
+  [[ "$1" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$1" == *:* ]]
+}
+
+tcping_direct_show_entries() {
+  local backend nft_table
+  backend=$(remote_exec "cat /etc/tcping_direct_backend 2>/dev/null | grep '^backend=' | cut -d= -f2")
+  nft_table=$(remote_exec "cat /etc/tcping_direct_backend 2>/dev/null | grep '^nft_table=' | cut -d= -f2")
+
+  if [[ "$backend" == "nft" && -n "$nft_table" ]]; then
+    info "--- IPv4 (nft set) ---"
+    remote_exec "nft list set inet $nft_table $TCPING_IPSET_NAME 2>/dev/null | grep -E '^\s+[0-9]'" || info "(无)"
+    info "--- IPv6 (nft set) ---"
+    remote_exec "nft list set inet $nft_table $TCPING_IPSET_NAME6 2>/dev/null | grep -E '^\s+[0-9a-fA-F]'" || info "(无)"
+  else
+    info "--- IPv4 (ipset) ---"
+    remote_exec "ipset list $TCPING_IPSET_NAME 2>/dev/null | grep -E '^[0-9]'" || info "(无)"
+    info "--- IPv6 (ipset) ---"
+    remote_exec "ipset list $TCPING_IPSET_NAME6 2>/dev/null | grep -E '^[0-9a-fA-F]'" || info "(无)"
+  fi
+}
+
+tcping_direct_parse_input() {
+  local raw="$1"
+  raw="${raw## }"; raw="${raw%% }"
+  [[ -z "$raw" ]] && return 1
+
+  raw="${raw#http://}"; raw="${raw#https://}"
+  raw="${raw%%/*}"
+
+  # IPv6 带中括号: [2408:xxxx::1] 或 [2408:xxxx::1]:port
+  if [[ "$raw" == "["* ]]; then
+    raw="${raw#\[}"
+    raw="${raw%%\]*}"
+    if tcping_direct_is_ipv6 "$raw"; then
+      echo "ipv6 $raw"; return 0
+    fi
+    return 1
+  fi
+
+  # 纯 IPv4
+  if tcping_direct_is_ipv4 "$raw"; then
+    echo "ipv4 $raw"; return 0
+  fi
+
+  # 纯 IPv6（不含中括号）
+  if tcping_direct_is_ipv6 "$raw"; then
+    echo "ipv6 $raw"; return 0
+  fi
+
+  # 域名（可能带 :port，去掉端口）
+  local domain="${raw%%:*}"
+  if [[ "$domain" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]]; then
+    echo "domain $domain"; return 0
+  fi
+
+  return 1
+}
+
+tcping_direct_regen_dnsmasq() {
+  local backend nft_table
+  backend=$(remote_exec "cat /etc/tcping_direct_backend 2>/dev/null | grep '^backend=' | cut -d= -f2")
+  nft_table=$(remote_exec "cat /etc/tcping_direct_backend 2>/dev/null | grep '^nft_table=' | cut -d= -f2")
+
+  local domains
+  domains=$(remote_exec "grep '^domain=' $TCPING_DIRECT_LIST 2>/dev/null | cut -d= -f2")
+
+  local domain_lines=""
+  if [[ -n "$domains" ]]; then
+    while IFS= read -r d; do
+      [[ -z "$d" ]] && continue
+      if [[ "$backend" == "nft" && -n "$nft_table" ]]; then
+        domain_lines="${domain_lines}nftset=/${d}/4#inet#${nft_table}#${TCPING_IPSET_NAME},6#inet#${nft_table}#${TCPING_IPSET_NAME6}
+"
+      else
+        domain_lines="${domain_lines}ipset=/${d}/${TCPING_IPSET_NAME},${TCPING_IPSET_NAME6}
+"
+      fi
+    done <<< "$domains"
+  fi
+
+  remote_sudo "cat > $TCPING_DNSMASQ_CONF << DNSEOF
+# dnsmasq 配置 - 由脚本自动生成，请勿手动编辑
+$TCPING_DNSMASQ_UPSTREAM
+listen-address=127.0.0.1
+bind-interfaces
+${domain_lines}DNSEOF"
+
+  remote_sudo "systemctl restart dnsmasq 2>/dev/null" || warn "dnsmasq 重启失败"
+}
+
+tcping_direct_setup() {
+  if ! ensure_remote_context; then
+    warn "无法建立 SSH 连接，已取消操作"; return 1
+  fi
+
+  info "安装 dnsmasq、ipset 和 dig..."
+  remote_sudo "apt-get update -qq && apt-get install -y -qq dnsmasq ipset dnsutils >/dev/null 2>&1" || {
+    err "安装失败"; return 1
+  }
+
+  info "停止 systemd-resolved 以避免端口冲突..."
+  remote_sudo "systemctl disable --now systemd-resolved 2>/dev/null || true"
+
+  info "检测防火墙后端..."
+  local use_nft nft_table="" backend="iptables"
+  use_nft=$(tcping_direct_detect_nft)
+  if (( use_nft )); then
+    nft_table=$(tcping_direct_find_nft_table)
+    if [[ -z "$nft_table" ]]; then
+      warn "未找到已有的 nft 标记表（qh_mark / relay_mark），将创建独立表 tcping_mark"
+      nft_table="tcping_mark"
+      remote_sudo "nft add table inet $nft_table"
+      remote_sudo "nft 'add chain inet $nft_table output { type route hook output priority -150; policy accept; }'"
+    fi
+    backend="nft"
+    info "使用 nft 后端，表: $nft_table"
+  else
+    info "使用 iptables 后端"
+  fi
+
+  remote_sudo "cat > /etc/tcping_direct_backend << CFGEOF
+backend=$backend
+nft_table=$nft_table
+CFGEOF"
+
+  if [[ "$backend" == "nft" ]]; then
+    remote_sudo "nft list set inet $nft_table $TCPING_IPSET_NAME >/dev/null 2>&1 || {
+      nft add set inet $nft_table $TCPING_IPSET_NAME '{ type ipv4_addr; flags timeout; }'
+      nft add rule inet $nft_table output ip daddr @$TCPING_IPSET_NAME meta mark set $SSH_DIRECT_MARK
+    }"
+    remote_sudo "nft list set inet $nft_table $TCPING_IPSET_NAME6 >/dev/null 2>&1 || {
+      nft add set inet $nft_table $TCPING_IPSET_NAME6 '{ type ipv6_addr; flags timeout; }'
+      nft add rule inet $nft_table output ip6 daddr @$TCPING_IPSET_NAME6 meta mark set $SSH_DIRECT_MARK
+    }"
+  else
+    remote_sudo "ipset create $TCPING_IPSET_NAME hash:ip timeout 0 2>/dev/null || true"
+    remote_sudo "ipset create $TCPING_IPSET_NAME6 hash:ip family inet6 timeout 0 2>/dev/null || true"
+    if ! remote_exec "iptables -t mangle -C OUTPUT -m set --match-set $TCPING_IPSET_NAME dst -j MARK --set-mark $SSH_DIRECT_MARK 2>/dev/null"; then
+      remote_sudo "iptables -t mangle -A OUTPUT -m set --match-set $TCPING_IPSET_NAME dst -j MARK --set-mark $SSH_DIRECT_MARK"
+    fi
+    if remote_exec "command -v ip6tables >/dev/null 2>&1"; then
+      if ! remote_exec "ip6tables -t mangle -C OUTPUT -m set --match-set $TCPING_IPSET_NAME6 dst -j MARK --set-mark $SSH_DIRECT_MARK 2>/dev/null"; then
+        remote_sudo "ip6tables -t mangle -A OUTPUT -m set --match-set $TCPING_IPSET_NAME6 dst -j MARK --set-mark $SSH_DIRECT_MARK"
+      fi
+    fi
+  fi
+  info "防火墙规则配置完成"
+
+  info "配置 SNAT/MASQUERADE（修正源地址）..."
+  if [[ "$backend" == "nft" ]]; then
+    remote_sudo "nft list chain inet $nft_table tcping_postrouting >/dev/null 2>&1 || \
+      nft 'add chain inet $nft_table tcping_postrouting { type nat hook postrouting priority srcnat; policy accept; }'"
+    remote_sudo "nft add rule inet $nft_table tcping_postrouting meta mark $SSH_DIRECT_MARK masquerade"
+  else
+    if ! remote_exec "iptables -t nat -C POSTROUTING -m mark --mark $SSH_DIRECT_MARK -j MASQUERADE 2>/dev/null"; then
+      remote_sudo "iptables -t nat -A POSTROUTING -m mark --mark $SSH_DIRECT_MARK -j MASQUERADE"
+    fi
+    if remote_exec "command -v ip6tables >/dev/null 2>&1"; then
+      if ! remote_exec "ip6tables -t nat -C POSTROUTING -m mark --mark $SSH_DIRECT_MARK -j MASQUERADE 2>/dev/null"; then
+        remote_sudo "ip6tables -t nat -A POSTROUTING -m mark --mark $SSH_DIRECT_MARK -j MASQUERADE"
+      fi
+    fi
+  fi
+
+  info "初始化配置文件..."
+  remote_sudo "mkdir -p /etc/dnsmasq.d"
+  if ! remote_exec "test -f $TCPING_DIRECT_LIST"; then
+    remote_sudo "cat > $TCPING_DIRECT_LIST << 'LISTEOF'
+# 直连列表 - 由脚本管理
+# 格式: domain=域名 | ipv4=地址 | ipv6=地址
+LISTEOF"
+  fi
+
+  tcping_direct_regen_dnsmasq
+
+  remote_sudo "grep -q '^conf-dir=/etc/dnsmasq.d' /etc/dnsmasq.conf 2>/dev/null || echo 'conf-dir=/etc/dnsmasq.d/,*.conf' >> /etc/dnsmasq.conf"
+
+  info "配置本机 DNS..."
+  remote_sudo "chattr -i /etc/resolv.conf 2>/dev/null || true"
+  remote_sudo "printf 'nameserver 127.0.0.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf"
+  remote_sudo "chattr +i /etc/resolv.conf 2>/dev/null || true"
+
+  remote_sudo "systemctl enable --now dnsmasq"
+  if ! remote_sudo "systemctl restart dnsmasq"; then
+    warn "dnsmasq 启动失败，请检查: journalctl -xeu dnsmasq.service"
+  fi
+
+  info "创建定时解析脚本..."
+  remote_sudo "cat > $TCPING_RESOLVER_SCRIPT << 'RESOLVEEOF'
+#!/bin/bash
+CONF=\"/etc/tcping-direct-list.conf\"
+BACKEND_FILE=\"/etc/tcping_direct_backend\"
+[ -f \"\$CONF\" ] || exit 0
+[ -f \"\$BACKEND_FILE\" ] || exit 0
+
+BACKEND=\$(grep '^backend=' \"\$BACKEND_FILE\" | cut -d= -f2)
+NFT_TABLE=\$(grep '^nft_table=' \"\$BACKEND_FILE\" | cut -d= -f2)
+
+add_v4() {
+  if [ \"\$BACKEND\" = \"nft\" ]; then
+    nft add element inet \"\$NFT_TABLE\" tcping_direct \"{ \$1 timeout 3600s }\" 2>/dev/null
+  else
+    ipset -exist add tcping_direct \"\$1\" timeout 3600
+  fi
+}
+add_v6() {
+  if [ \"\$BACKEND\" = \"nft\" ]; then
+    nft add element inet \"\$NFT_TABLE\" tcping_direct6 \"{ \$1 timeout 3600s }\" 2>/dev/null
+  else
+    ipset -exist add tcping_direct6 \"\$1\" timeout 3600
+  fi
+}
+add_v4_perm() {
+  if [ \"\$BACKEND\" = \"nft\" ]; then
+    nft add element inet \"\$NFT_TABLE\" tcping_direct \"{ \$1 }\" 2>/dev/null
+  else
+    ipset -exist add tcping_direct \"\$1\" timeout 0
+  fi
+}
+add_v6_perm() {
+  if [ \"\$BACKEND\" = \"nft\" ]; then
+    nft add element inet \"\$NFT_TABLE\" tcping_direct6 \"{ \$1 }\" 2>/dev/null
+  else
+    ipset -exist add tcping_direct6 \"\$1\" timeout 0
+  fi
+}
+
+is_ipv4() { echo \"\$1\" | grep -qE '^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+\$'; }
+is_ipv6() { echo \"\$1\" | grep -qE '^[0-9a-fA-F:]+\$' && echo \"\$1\" | grep -q ':.*:.*:'; }
+
+grep '^domain=' \"\$CONF\" | cut -d= -f2 | while IFS= read -r d; do
+  [ -z \"\$d\" ] && continue
+  dig +short +tries=2 +time=3 \"\$d\" A @8.8.8.8 2>/dev/null | while IFS= read -r ip; do
+    is_ipv4 \"\$ip\" && add_v4 \"\$ip\"
+  done
+  dig +short +tries=2 +time=3 \"\$d\" AAAA @8.8.8.8 2>/dev/null | while IFS= read -r ip6; do
+    is_ipv6 \"\$ip6\" && add_v6 \"\$ip6\"
+  done
+done
+
+grep '^ipv4=' \"\$CONF\" | cut -d= -f2 | while IFS= read -r ip; do
+  is_ipv4 \"\$ip\" && add_v4_perm \"\$ip\"
+done
+grep '^ipv6=' \"\$CONF\" | cut -d= -f2 | while IFS= read -r ip6; do
+  is_ipv6 \"\$ip6\" && add_v6_perm \"\$ip6\"
+done
+RESOLVEEOF"
+  remote_sudo "chmod +x $TCPING_RESOLVER_SCRIPT"
+
+  info "配置定时刷新（每 10 分钟）..."
+  remote_sudo "cat > /etc/systemd/system/tcping-direct-resolve.service << TIMEREOF
+[Unit]
+Description=Resolve tcping direct domains
+
+[Service]
+Type=oneshot
+ExecStart=$TCPING_RESOLVER_SCRIPT
+TIMEREOF"
+
+  remote_sudo "cat > /etc/systemd/system/tcping-direct-resolve.timer << 'TIMEREOF'
+[Unit]
+Description=Periodic tcping direct DNS resolve
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=600
+
+[Install]
+WantedBy=timers.target
+TIMEREOF"
+  remote_sudo "systemctl daemon-reload && systemctl enable --now tcping-direct-resolve.timer"
+
+  info "配置持久化..."
+  remote_sudo "cat > /usr/local/bin/restore-tcping-direct.sh << 'PERSISTEOF'
+#!/bin/bash
+sleep 5
+/usr/local/bin/tcping-direct-resolve.sh 2>/dev/null || true
+PERSISTEOF"
+  remote_sudo "chmod +x /usr/local/bin/restore-tcping-direct.sh"
+
+  remote_sudo "cat > /etc/systemd/system/tcping-direct.service << 'SVCEOF'
+[Unit]
+Description=Restore tcping direct entries
+After=network-online.target dnsmasq.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/restore-tcping-direct.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF"
+  remote_sudo "systemctl daemon-reload && systemctl enable tcping-direct.service"
+
+  info "执行首次域名解析..."
+  remote_sudo "$TCPING_RESOLVER_SCRIPT"
+
+  info ""
+  info "直连域名环境初始化完成！"
+  info "子域名会通过 dnsmasq 自动匹配（添加 oojj.de 即覆盖 *.oojj.de）"
+  mark_action "tcping_direct_setup" "直连域名环境已初始化"
+}
+
+tcping_direct_add_domains() {
+  if ! ensure_remote_context; then
+    warn "无法建立 SSH 连接，已取消操作"; return 1
+  fi
+
+  if ! remote_exec "test -f $TCPING_DIRECT_LIST"; then
+    err "尚未初始化，请先执行「初始化直连环境」"; return 1
+  fi
+
+  echo ""
+  info "请输入要添加的域名或 IP 地址（支持 IPv4/IPv6，每行一个，输入空行结束）："
+  info "示例: oojj.de | 1.2.3.4 | 2408:8756::1 | [2408:8756::1]"
+  local domains=() ipv4s=() ipv6s=()
+  while true; do
+    read -rp "> " raw_input
+    [[ -z "${raw_input## }" ]] && break
+    local parsed
+    parsed=$(tcping_direct_parse_input "$raw_input") || {
+      warn "无效格式，已跳过: $raw_input"; continue
+    }
+    local ptype="${parsed%% *}" pval="${parsed#* }"
+    case "$ptype" in
+      domain) domains+=("$pval") ;;
+      ipv4)   ipv4s+=("$pval") ;;
+      ipv6)   ipv6s+=("$pval") ;;
+    esac
+  done
+
+  if [[ ${#domains[@]} -eq 0 && ${#ipv4s[@]} -eq 0 && ${#ipv6s[@]} -eq 0 ]]; then
+    warn "未输入任何有效条目"; return 1
+  fi
+
+  local has_new_domains=0
+  if [[ ${#domains[@]} -gt 0 ]]; then
+    info "正在添加 ${#domains[@]} 个域名..."
+    for d in "${domains[@]}"; do
+      if remote_exec "grep -qx 'domain=$d' $TCPING_DIRECT_LIST 2>/dev/null"; then
+        warn "域名已存在，跳过: $d"
+      else
+        remote_sudo "echo 'domain=$d' >> $TCPING_DIRECT_LIST"
+        info "已添加域名: $d（含所有子域名）"
+        has_new_domains=1
+      fi
+    done
+  fi
+
+  if [[ ${#ipv4s[@]} -gt 0 ]]; then
+    info "正在添加 ${#ipv4s[@]} 个 IPv4 地址..."
+    for ip in "${ipv4s[@]}"; do
+      if remote_exec "grep -qx 'ipv4=$ip' $TCPING_DIRECT_LIST 2>/dev/null"; then
+        warn "IPv4 已存在，跳过: $ip"
+      else
+        remote_sudo "echo 'ipv4=$ip' >> $TCPING_DIRECT_LIST"
+        info "已添加 IPv4: $ip"
+      fi
+    done
+  fi
+
+  if [[ ${#ipv6s[@]} -gt 0 ]]; then
+    info "正在添加 ${#ipv6s[@]} 个 IPv6 地址..."
+    for ip6 in "${ipv6s[@]}"; do
+      if remote_exec "grep -qx 'ipv6=$ip6' $TCPING_DIRECT_LIST 2>/dev/null"; then
+        warn "IPv6 已存在，跳过: $ip6"
+      else
+        remote_sudo "echo 'ipv6=$ip6' >> $TCPING_DIRECT_LIST"
+        info "已添加 IPv6: $ip6"
+      fi
+    done
+  fi
+
+  if (( has_new_domains )); then
+    info "重新生成 dnsmasq 配置（包含子域名匹配）..."
+    tcping_direct_regen_dnsmasq
+  fi
+
+  info "执行域名解析..."
+  remote_sudo "$TCPING_RESOLVER_SCRIPT"
+
+  info ""
+  info "添加完成！当前 nft/ipset 条目："
+  tcping_direct_show_entries
+  mark_action "tcping_direct_add" "添加: 域名=${domains[*]} IPv4=${ipv4s[*]} IPv6=${ipv6s[*]}"
+}
+
+tcping_direct_remove_domains() {
+  if ! ensure_remote_context; then
+    warn "无法建立 SSH 连接，已取消操作"; return 1
+  fi
+
+  if ! remote_exec "test -f $TCPING_DIRECT_LIST"; then
+    err "尚未初始化，请先执行「初始化直连域名环境」"; return 1
+  fi
+
+  local raw_entries
+  raw_entries=$(remote_exec "grep -E '^(domain|ipv4|ipv6)=' $TCPING_DIRECT_LIST 2>/dev/null")
+
+  if [[ -z "$raw_entries" ]]; then
+    info "当前没有任何直连条目"; return 0
+  fi
+
+  echo ""
+  info "当前直连列表："
+  local i=0 entry_arr=() entry_type_arr=()
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    i=$((i+1))
+    local etype="${line%%=*}" evalue="${line#*=}"
+    entry_arr+=("$evalue")
+    entry_type_arr+=("$etype")
+    case "$etype" in
+      domain) echo "  $i) [域名] $evalue" ;;
+      ipv4)   echo "  $i) [IPv4] $evalue" ;;
+      ipv6)   echo "  $i) [IPv6] $evalue" ;;
+    esac
+  done <<< "$raw_entries"
+
+  echo ""
+  read -rp "请输入要删除的序号（多个用空格分隔，输入 a 删除全部）: " selections
+  if [[ -z "$selections" ]]; then
+    info "未选择任何条目"; return 0
+  fi
+
+  local to_remove_idx=()
+  if [[ "$selections" == "a" || "$selections" == "A" ]]; then
+    for ((j=0; j<${#entry_arr[@]}; j++)); do to_remove_idx+=("$j"); done
+  else
+    for s in $selections; do
+      if [[ "$s" =~ ^[0-9]+$ ]] && (( s >= 1 && s <= ${#entry_arr[@]} )); then
+        to_remove_idx+=("$((s-1))")
+      else
+        warn "无效序号，已跳过: $s"
+      fi
+    done
+  fi
+
+  if [[ ${#to_remove_idx[@]} -eq 0 ]]; then
+    warn "未选中任何有效条目"; return 1
+  fi
+
+  local has_domain_change=0 removed_names=()
+  for idx in "${to_remove_idx[@]}"; do
+    local entry="${entry_arr[$idx]}" etype="${entry_type_arr[$idx]}"
+    remote_sudo "sed -i '\\|^${etype}=${entry}$|d' $TCPING_DIRECT_LIST"
+    case "$etype" in
+      domain) has_domain_change=1; info "已删除域名: $entry" ;;
+      ipv4)   info "已删除 IPv4: $entry" ;;
+      ipv6)   info "已删除 IPv6: $entry" ;;
+    esac
+    removed_names+=("$entry")
+  done
+
+  if (( has_domain_change )); then
+    info "重新生成 dnsmasq 配置..."
+    tcping_direct_regen_dnsmasq
+  fi
+
+  info "重新解析所有条目..."
+  local backend
+  backend=$(remote_exec "cat /etc/tcping_direct_backend 2>/dev/null | grep '^backend=' | cut -d= -f2")
+  local nft_table
+  nft_table=$(remote_exec "cat /etc/tcping_direct_backend 2>/dev/null | grep '^nft_table=' | cut -d= -f2")
+  if [[ "$backend" == "nft" && -n "$nft_table" ]]; then
+    remote_sudo "nft flush set inet $nft_table $TCPING_IPSET_NAME 2>/dev/null || true"
+    remote_sudo "nft flush set inet $nft_table $TCPING_IPSET_NAME6 2>/dev/null || true"
+  else
+    remote_sudo "ipset flush $TCPING_IPSET_NAME 2>/dev/null || true"
+    remote_sudo "ipset flush $TCPING_IPSET_NAME6 2>/dev/null || true"
+  fi
+  remote_sudo "$TCPING_RESOLVER_SCRIPT"
+
+  info "删除完成"
+  mark_action "tcping_direct_remove" "删除: ${removed_names[*]}"
+}
+
+tcping_direct_list() {
+  if ! ensure_remote_context; then
+    warn "无法建立 SSH 连接，已取消操作"; return 1
+  fi
+
+  if ! remote_exec "test -f $TCPING_DIRECT_LIST"; then
+    err "尚未初始化，请先执行「初始化直连域名环境」"; return 1
+  fi
+
+  echo ""
+  echo "=============================="
+  echo " 当前直连列表"
+  echo "=============================="
+  local raw_entries
+  raw_entries=$(remote_exec "grep -E '^(domain|ipv4|ipv6)=' $TCPING_DIRECT_LIST 2>/dev/null")
+  if [[ -z "$raw_entries" ]]; then
+    info "(无条目)"
+  else
+    local i=0
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      i=$((i+1))
+      local etype="${line%%=*}" evalue="${line#*=}"
+      case "$etype" in
+        domain) echo "  $i) [域名] $evalue" ;;
+        ipv4)   echo "  $i) [IPv4] $evalue" ;;
+        ipv6)   echo "  $i) [IPv6] $evalue" ;;
+      esac
+    done <<< "$raw_entries"
+  fi
+
+  echo ""
+  echo "=============================="
+  echo " 已匹配的 IP 条目"
+  echo "=============================="
+  tcping_direct_show_entries
+
+  echo ""
+  info "dnsmasq 状态："
+  remote_exec "systemctl is-active dnsmasq 2>/dev/null || echo 'inactive'"
+}
+
+tcping_direct_clear() {
+  if ! ensure_remote_context; then
+    warn "无法建立 SSH 连接，已取消操作"; return 1
+  fi
+
+  read -rp "确认清除所有直连域名配置？这将卸载 dnsmasq 相关配置 [y/N]: " confirm
+  if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+    info "已取消"; return 0
+  fi
+
+  info "清除防火墙规则..."
+  local backend nft_table
+  backend=$(remote_exec "cat /etc/tcping_direct_backend 2>/dev/null | grep '^backend=' | cut -d= -f2")
+  nft_table=$(remote_exec "cat /etc/tcping_direct_backend 2>/dev/null | grep '^nft_table=' | cut -d= -f2")
+
+  if [[ "$backend" == "nft" ]]; then
+    if [[ -n "$nft_table" ]]; then
+      remote_sudo "nft delete chain inet $nft_table tcping_postrouting 2>/dev/null || true"
+      remote_sudo "nft delete set inet $nft_table $TCPING_IPSET_NAME 2>/dev/null || true"
+      remote_sudo "nft delete set inet $nft_table $TCPING_IPSET_NAME6 2>/dev/null || true"
+      if [[ "$nft_table" == "tcping_mark" ]]; then
+        remote_sudo "nft delete table inet tcping_mark 2>/dev/null || true"
+      fi
+    fi
+    for t in qh_mark relay_mark tcping_mark; do
+      remote_sudo "nft delete chain inet $t tcping_postrouting 2>/dev/null || true"
+      remote_sudo "nft delete set inet $t $TCPING_IPSET_NAME 2>/dev/null || true"
+      remote_sudo "nft delete set inet $t $TCPING_IPSET_NAME6 2>/dev/null || true"
+    done
+  else
+    remote_sudo "iptables -t mangle -D OUTPUT -m set --match-set $TCPING_IPSET_NAME dst -j MARK --set-mark $SSH_DIRECT_MARK 2>/dev/null || true"
+    remote_sudo "ip6tables -t mangle -D OUTPUT -m set --match-set $TCPING_IPSET_NAME6 dst -j MARK --set-mark $SSH_DIRECT_MARK 2>/dev/null || true"
+    remote_sudo "iptables -t nat -D POSTROUTING -m mark --mark $SSH_DIRECT_MARK -j MASQUERADE 2>/dev/null || true"
+    remote_sudo "ip6tables -t nat -D POSTROUTING -m mark --mark $SSH_DIRECT_MARK -j MASQUERADE 2>/dev/null || true"
+  fi
+
+  info "删除 ipset..."
+  remote_sudo "ipset destroy $TCPING_IPSET_NAME 2>/dev/null || true"
+  remote_sudo "ipset destroy $TCPING_IPSET_NAME6 2>/dev/null || true"
+  remote_sudo "rm -f /etc/ipset.rules"
+
+  info "清除配置文件..."
+  remote_sudo "rm -f $TCPING_DIRECT_LIST $TCPING_DNSMASQ_CONF /etc/tcping_direct_backend /etc/tcping_direct_nft_table"
+  remote_sudo "systemctl restart dnsmasq 2>/dev/null || true"
+
+  info "恢复 DNS 设置..."
+  remote_sudo "chattr -i /etc/resolv.conf 2>/dev/null || true"
+  remote_sudo "echo -e 'nameserver 8.8.8.8\nnameserver 1.1.1.1' > /etc/resolv.conf"
+
+  info "清除定时服务..."
+  remote_sudo "systemctl disable --now tcping-direct-resolve.timer 2>/dev/null || true"
+  remote_sudo "rm -f /etc/systemd/system/tcping-direct-resolve.timer /etc/systemd/system/tcping-direct-resolve.service"
+
+  info "清除持久化服务..."
+  remote_sudo "systemctl disable --now tcping-direct.service 2>/dev/null || true"
+  remote_sudo "rm -f /etc/systemd/system/tcping-direct.service /usr/local/bin/restore-tcping-direct.sh $TCPING_RESOLVER_SCRIPT"
+  remote_sudo "systemctl daemon-reload"
+
+  info ""
+  info "直连域名配置已完全清除"
+  mark_action "tcping_direct_clear" "直连域名配置已清除"
+}
+
+tcping_direct_refresh() {
+  if ! ensure_remote_context; then
+    warn "无法建立 SSH 连接，已取消操作"; return 1
+  fi
+
+  if ! remote_exec "test -f $TCPING_DIRECT_LIST"; then
+    err "尚未初始化，请先执行「初始化直连域名环境」"; return 1
+  fi
+
+  local backend nft_table
+  backend=$(remote_exec "cat /etc/tcping_direct_backend 2>/dev/null | grep '^backend=' | cut -d= -f2")
+  nft_table=$(remote_exec "cat /etc/tcping_direct_backend 2>/dev/null | grep '^nft_table=' | cut -d= -f2")
+
+  info "清空条目并重新解析..."
+  if [[ "$backend" == "nft" && -n "$nft_table" ]]; then
+    remote_sudo "nft flush set inet $nft_table $TCPING_IPSET_NAME 2>/dev/null || true"
+    remote_sudo "nft flush set inet $nft_table $TCPING_IPSET_NAME6 2>/dev/null || true"
+  else
+    remote_sudo "ipset flush $TCPING_IPSET_NAME 2>/dev/null || true"
+    remote_sudo "ipset flush $TCPING_IPSET_NAME6 2>/dev/null || true"
+  fi
+
+  info "重新生成 dnsmasq 配置..."
+  tcping_direct_regen_dnsmasq
+
+  remote_sudo "$TCPING_RESOLVER_SCRIPT" || warn "解析脚本执行失败"
+
+  info ""
+  info "DNS 刷新完成！"
+  tcping_direct_show_entries
+  mark_action "tcping_direct_refresh" "刷新域名解析"
+}
+
+show_tcping_direct_menu() {
+  cat <<'MENU'
+==============================
+ 直连域名管理（绕过隧道）
+==============================
+1) 初始化直连环境
+2) 添加条目（域名/IPv4/IPv6）
+3) 删除条目
+4) 查看列表和 ipset
+5) 刷新 DNS 解析
+6) 清除所有配置
+b) 返回上级菜单
+MENU
+}
+
+tcping_direct_menu_loop() {
+  while true; do
+    show_tcping_direct_menu
+    read -rp "请选择操作: " choice
+    case "$choice" in
+      1) run_menu_action "初始化直连域名环境" tcping_direct_setup ;;
+      2) run_menu_action "添加直连域名" tcping_direct_add_domains ;;
+      3) run_menu_action "删除直连域名" tcping_direct_remove_domains ;;
+      4) run_menu_action "查看直连域名" tcping_direct_list ;;
+      5) run_menu_action "刷新DNS解析" tcping_direct_refresh ;;
+      6) run_menu_action "清除直连域名配置" tcping_direct_clear ;;
+      b|B) break ;;
+      *) echo "无效选项，请重新输入" ;;
+    esac
+    echo
+  done
+}
+
 # ==================== 菜单函数 ====================
 show_proxy_menu() {
   cat <<'MENU'
@@ -4248,6 +4927,7 @@ show_route_menu() {
 8) 取消IPv6传输（SIT隧道）
 9) 配置内网中转（让内网其他机器经本机到香港）
 10) 取消内网中转
+11) 直连域名管理（tcping节点绕过隧道）
 b) 返回模式选择
 q) 退出
 MENU
@@ -4672,6 +5352,7 @@ main() {
           8) run_menu_action "取消IPv6传输（SIT隧道）" clear_ipv6_transport ;;
           9) run_menu_action "配置内网中转" setup_relay_transit ;;
           10) run_menu_action "取消内网中转" clear_relay_transit ;;
+          11) tcping_direct_menu_loop ;;
           b|B)
             break
             ;;
