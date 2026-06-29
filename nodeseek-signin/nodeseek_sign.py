@@ -570,57 +570,63 @@ def sign_in(cookie, random_mode="true", proxy=""):
         return "error", str(e)
 
 
-# ==================== GitHub 变量更新 ====================
+# ==================== GitHub Secret 更新 ====================
 def save_cookie_to_github(cookie_str):
     """
-    将 Cookie 保存到 GitHub Actions 仓库变量
-    需要 GH_PAT (有 repo / Actions 变量写权限) 和 GITHUB_REPOSITORY 环境变量
+    将 Cookie 保存到 GitHub Actions 仓库 Secret
+    需要 GH_PAT (有 repo 权限) 和 GITHUB_REPOSITORY 环境变量
     """
     token = get_env("GH_PAT")
     repo = os.environ.get("GITHUB_REPOSITORY", "")
 
     if not token or not repo:
-        log.warning("GH_PAT 或 GITHUB_REPOSITORY 未设置，跳过 GitHub 变量更新")
+        log.warning("GH_PAT 或 GITHUB_REPOSITORY 未设置，跳过 GitHub Secret 更新")
         return False
 
-    var_name = "NS_COOKIE"
+    # 用 libsodium 加密 secret（GitHub API 要求）
+    import base64
+    try:
+        from nacl import public
+    except ImportError:
+        log.warning("pynacl 未安装，无法加密 Secret，跳过更新。pip install pynacl")
+        return False
+
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
     }
 
-    # 尝试更新已有变量
-    url = f"https://api.github.com/repos/{repo}/actions/variables/{var_name}"
-    try:
-        resp = requests.patch(
-            url,
-            headers=headers,
-            json={"name": var_name, "value": cookie_str},
-            timeout=30,
-        )
-        if resp.status_code == 204:
-            log.info(f"GitHub 变量 {var_name} 更新成功")
-            return True
-        elif resp.status_code == 404:
-            # 变量不存在，创建
-            create_url = f"https://api.github.com/repos/{repo}/actions/variables"
-            resp = requests.post(
-                create_url,
-                headers=headers,
-                json={"name": var_name, "value": cookie_str},
-                timeout=30,
-            )
-            if resp.status_code == 201:
-                log.info(f"GitHub 变量 {var_name} 创建成功")
-                return True
-            log.error(f"GitHub 变量创建失败: {resp.status_code} {resp.text}")
-            return False
-        else:
-            log.error(f"GitHub 变量更新失败: {resp.status_code} {resp.text}")
-            return False
-    except Exception as e:
-        log.error(f"GitHub 变量更新异常: {e}")
+    secret_name = "NS_COOKIE"
+
+    # 1. 获取仓库公钥
+    key_url = f"https://api.github.com/repos/{repo}/actions/secrets/public-key"
+    resp = requests.get(key_url, headers=headers, timeout=30)
+    if resp.status_code != 200:
+        log.error(f"获取仓库公钥失败: {resp.status_code} {resp.text}")
         return False
+
+    key_data = resp.json()
+    public_key = public.PublicKey(base64.b64decode(key_data["key"]))
+    key_id = key_data["key_id"]
+
+    # 2. 加密 secret 值
+    sealed_box = public.SealedBox(public_key)
+    encrypted = sealed_box.encrypt(cookie_str.encode("utf-8"))
+    encrypted_b64 = base64.b64encode(encrypted).decode("utf-8")
+
+    # 3. 创建或更新 secret
+    secret_url = f"https://api.github.com/repos/{repo}/actions/secrets/{secret_name}"
+    resp = requests.put(
+        secret_url,
+        headers=headers,
+        json={"encrypted_value": encrypted_b64, "key_id": key_id},
+        timeout=30,
+    )
+    if resp.status_code in (201, 204):
+        log.info(f"GitHub Secret {secret_name} 更新成功")
+        return True
+    log.error(f"GitHub Secret 更新失败: {resp.status_code} {resp.text}")
+    return False
 
 
 # ==================== 主流程 ====================
