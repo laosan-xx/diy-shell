@@ -27,29 +27,18 @@ jobs:
 
       - name: 执行签到
         env:
-          # ===== 签到配置 =====
           NS_RANDOM: ${{ vars.NS_RANDOM }}
           NS_DELAY: ${{ vars.NS_DELAY }}
           NS_HEADLESS: ${{ vars.NS_HEADLESS }}
           NS_PROXY: ${{ secrets.NS_PROXY }}
-
-          # ===== 登录方式一：Cookie（推荐）=====
           NS_COOKIE: ${{ secrets.NS_COOKIE }}
-
-          # ===== 登录方式二：账号密码 =====
           NS_USERNAME: ${{ secrets.NS_USERNAME }}
           NS_PASSWORD: ${{ secrets.NS_PASSWORD }}
-
-          # ===== Telegram 通知（可选）=====
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           TG_API_URL: ${{ secrets.TG_API_URL }}
-
-          # ===== GitHub 变量自动更新（可选）=====
           GH_PAT: ${{ secrets.GH_PAT }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-
-      - name: 执行签到脚本
         run: |
           if [ "${NS_HEADLESS}" = "false" ]; then
             sudo apt-get install -y xvfb
