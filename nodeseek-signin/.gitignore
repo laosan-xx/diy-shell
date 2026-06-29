@@ -23,3 +23,9 @@ env/
 
 # Cookie 文件
 cookie/
+
+# 调试截图
+debug_*.png
+
+# SeleniumBase 运行时文件
+downloaded_files/

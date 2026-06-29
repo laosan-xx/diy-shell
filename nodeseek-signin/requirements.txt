@@ -1,2 +1,2 @@
 curl_cffi>=0.7.0
-patchright>=1.0.0
+seleniumbase>=4.20.0

@@ -3,7 +3,7 @@
 """
 NodeSeek 论坛自动签到工具
 - 支持 Cookie 或 账号密码登录
-- 账号密码登录通过 patchright 浏览器自动求解 Cloudflare Turnstile 验证码（免费，无需打码平台）
+- 账号密码登录通过 SeleniumBase UC 模式自动求解 Cloudflare Turnstile 验证码（免费，无需打码平台）
 - 签到请求通过 curl_cffi 浏览器指纹模拟绕过 Cloudflare TLS 校验
 - 支持 Telegram 通知
 - 自动更新 Cookie 并保存至 GitHub Actions 变量
@@ -81,134 +81,454 @@ def send_telegram(message):
         return False
 
 
-# ==================== 账号密码登录（patchright 浏览器求解 Turnstile）====================
-def login_with_credentials(username, password):
+# ==================== 账号密码登录（SeleniumBase UC 模式求解 Turnstile）====================
+def _detect_system_proxy():
+    """自动检测系统代理设置（Windows）"""
+    # 1. 环境变量 NS_PROXY 优先
+    proxy = get_env("NS_PROXY", "")
+    if proxy:
+        return proxy
+
+    # 2. 检测常见的系统代理环境变量
+    for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"):
+        val = os.environ.get(var, "")
+        if val and val.strip():
+            return val.strip()
+
+    # 3. Windows: 从注册表读取系统代理设置
+    if sys.platform == "win32":
+        try:
+            import winreg
+            key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+            )
+            proxy_enable, _ = winreg.QueryValueEx(key, "ProxyEnable")
+            if proxy_enable:
+                proxy_server, _ = winreg.QueryValueEx(key, "ProxyServer")
+                winreg.CloseKey(key)
+                if proxy_server:
+                    if "=" in proxy_server:
+                        for part in proxy_server.split(";"):
+                            if part.startswith("http=") or part.startswith("https="):
+                                addr = part.split("=", 1)[1]
+                                if not addr.startswith("http"):
+                                    addr = "http://" + addr
+                                return addr
+                    else:
+                        if not proxy_server.startswith("http"):
+                            proxy_server = "http://" + proxy_server
+                        return proxy_server
+            winreg.CloseKey(key)
+        except Exception:
+            pass
+
+    return ""
+
+
+def _test_proxy_for_cloudflare(proxy_url):
+    """测试代理是否能访问 challenges.cloudflare.com，自动检测代理类型"""
+    import urllib.request
+
+    # 解析代理地址和端口
+    if "://" in proxy_url:
+        scheme, rest = proxy_url.split("://", 1)
+    else:
+        scheme = ""
+        rest = proxy_url
+
+    # 要测试的代理格式列表（socks5 优先，V2Ray/Xray 常用 socks5 端口）
+    if scheme:
+        candidates = [proxy_url]
+    else:
+        candidates = [
+            f"socks5://{rest}",
+            f"http://{rest}",
+        ]
+
+    for candidate in candidates:
+        try:
+            proxy_handler = urllib.request.ProxyHandler({
+                "http": candidate,
+                "https": candidate,
+            })
+            opener = urllib.request.build_opener(proxy_handler)
+            req = urllib.request.Request(
+                "https://challenges.cloudflare.com/turnstile/v0/api.js",
+                headers={"User-Agent": DEFAULT_UA},
+            )
+            resp = opener.open(req, timeout=10)
+            if resp.status == 200:
+                return candidate
+        except Exception:
+            continue
+
+    return None
+
+
+def login_with_credentials(username, password, random_mode="true"):
     """
     使用账号密码登录 NodeSeek，返回 Cookie 字符串
-    通过 patchright 启动无头浏览器，加载登录页让 Cloudflare Turnstile 自动求解，
-    在浏览器内调用登录 API 确保 token 与会话一致，最后提取浏览器 Cookie。
+    通过 SeleniumBase UC 模式（undetected-chromedriver）启动浏览器，
+    让 Cloudflare Turnstile 在真实 Chrome 环境中自动求解，然后执行登录。
     无需任何第三方打码平台，完全免费。
     """
     try:
-        from patchright.sync_api import sync_playwright
+        from seleniumbase import Driver
     except ImportError:
-        log.error("patchright 未安装，无法使用账号密码登录")
-        log.error("请执行: pip install patchright && python -m patchright install chromium")
+        log.error("seleniumbase 未安装，无法使用账号密码登录")
+        log.error("请执行: pip install seleniumbase")
         return None
 
-    # headless 模式：默认 True，Cloudflare 检测严格时可设为 False（GitHub Actions 需配合 xvfb）
     headless = get_env("NS_HEADLESS", "true") != "false"
+    raw_proxy = _detect_system_proxy()
 
-    log.info(f"正在使用浏览器登录: {username}（headless={headless}）")
+    # 测试代理是否能访问 challenges.cloudflare.com
+    proxy_url = ""
+    if raw_proxy:
+        log.info(f"检测到系统代理: {raw_proxy}，测试连通性...")
+        proxy_url = _test_proxy_for_cloudflare(raw_proxy)
+        if proxy_url:
+            log.info(f"代理测试通过: {proxy_url}")
+        else:
+            log.warning(f"代理 {raw_proxy} 无法访问 challenges.cloudflare.com，尝试不带代理运行...")
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
-        context = browser.new_context(user_agent=DEFAULT_UA)
-        page = context.new_page()
+    log.info(f"正在使用浏览器登录: {username}（headless={headless}, proxy={'已设置: ' + proxy_url if proxy_url else '无'}）")
 
-        try:
-            # 1. 访问登录页
-            log.info("访问登录页...")
-            page.goto(LOGIN_PAGE, timeout=30000)
-            try:
-                page.wait_for_load_state("networkidle", timeout=15000)
-            except Exception:
-                pass
+    # 构建 SeleniumBase Driver 参数
+    driver_kwargs = {
+        "uc": True,  # undetected-chromedriver 模式
+        "headless": headless,
+        "locale_code": "zh-CN",
+    }
+    if proxy_url:
+        # SeleniumBase 代理参数格式: "host:port" 或带协议
+        driver_kwargs["proxy"] = proxy_url
 
-            # 2. 等待 Cloudflare Turnstile 自动求解
-            log.info("等待 Turnstile 验证码自动求解...")
-            token = None
-            try:
-                page.wait_for_function(
-                    """() => {
-                        // 检查 cf-turnstile-response 隐藏输入框
-                        const el = document.querySelector('[name="cf-turnstile-response"]');
-                        if (el && el.value && el.value.length > 10) return true;
-                        // 检查 Turnstile 组件的 data-response 属性
-                        const widget = document.querySelector('.cf-turnstile');
-                        if (widget) {
-                            const r = widget.getAttribute('data-response');
-                            if (r && r.length > 10) return true;
-                        }
-                        return false;
-                    }""",
-                    timeout=30000,
-                )
-                token = page.evaluate(
-                    """() => {
-                        const el = document.querySelector('[name="cf-turnstile-response"]');
-                        if (el && el.value && el.value.length > 10) return el.value;
-                        const widget = document.querySelector('.cf-turnstile');
-                        if (widget) {
-                            const r = widget.getAttribute('data-response');
-                            if (r) return r;
-                        }
-                        return null;
-                    }"""
-                )
-            except Exception:
-                pass
+    driver = None
+    try:
+        driver = Driver(**driver_kwargs)
+        driver.maximize_window()
+        # 设置异步脚本超时（execute_async_script 等待 callback 的最长时间）
+        driver.set_script_timeout(30)
 
-            if not token:
-                log.error("Turnstile 验证码求解超时，登录失败")
-                browser.close()
-                return None
+        # 1. 访问登录页
+        log.info("访问登录页...")
+        driver.uc_open_with_reconnect(LOGIN_PAGE, reconnect_time=4)
+        time.sleep(3)
 
-            log.info("Turnstile 验证码求解成功")
-
-            # 3. 在浏览器内调用登录 API（确保 token 与会话一致）
-            log.info("调用登录接口...")
-            result = page.evaluate(
-                """async (args) => {
-                    try {
-                        const resp = await fetch(args.loginApi, {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({
-                                username: args.username,
-                                password: args.password,
-                                token: args.token,
-                                source: 'turnstile'
-                            })
-                        });
-                        return await resp.json();
-                    } catch(e) {
-                        return { success: false, message: e.toString() };
-                    }
-                }""",
-                {
-                    "loginApi": LOGIN_API,
-                    "username": username,
-                    "password": password,
-                    "token": token,
-                },
+        # 2. 检查 turnstile 全局对象是否就绪，如果就绪但 widget 未渲染则手动渲染
+        log.info("检查 Turnstile 全局对象...")
+        time.sleep(2)
+        turnstile_ready = driver.execute_script(
+            """return typeof turnstile !== 'undefined' && typeof turnstile.render === 'function';"""
+        )
+        if turnstile_ready:
+            # 检查是否已有 widget
+            has_widget = driver.execute_script(
+                """return !!(document.querySelector('iframe[src*="challenges.cloudflare.com"]') || document.querySelector('.cf-turnstile'));"""
             )
+            if not has_widget:
+                log.info("Turnstile 全局对象已就绪但 widget 未渲染，手动调用 turnstile.render()...")
+                # 查找或创建容器
+                driver.execute_script(
+                    """(function() {
+                        // 查找 NodeSeek 的 Turnstile 容器
+                        var container = document.querySelector('[data-sitekey]')
+                                    || document.querySelector('.cf-turnstile')
+                                    || document.querySelector('#turnstile-container')
+                                    || document.querySelector('[id*="turnstile"]');
+                        if (!container) {
+                            // 创建一个新容器
+                            container = document.createElement('div');
+                            container.id = 'ns-turnstile-container';
+                            // 插入到登录表单附近
+                            var form = document.querySelector('form') || document.body;
+                            form.parentNode.insertBefore(container, form.nextSibling);
+                        }
+                        // 获取 sitekey
+                        var sitekey = container.getAttribute('data-sitekey') || '0x4AAAAAAAaNy7leGjewpVyR';
+                        // 调用 turnstile.render
+                        try {
+                            turnstile.render(container, {
+                                sitekey: sitekey,
+                                callback: function(token) {
+                                    var el = document.querySelector('[name="cf-turnstile-response"]');
+                                    if (!el) {
+                                        el = document.createElement('input');
+                                        el.type = 'hidden';
+                                        el.name = 'cf-turnstile-response';
+                                        document.body.appendChild(el);
+                                    }
+                                    el.value = token;
+                                }
+                            });
+                            window._ns_turnstile_rendered = true;
+                        } catch(e) {
+                            window._ns_turnstile_error = e.toString();
+                        }
+                    })();"""
+                )
+                # 检查渲染结果
+                render_result = driver.execute_script(
+                    """return { rendered: window._ns_turnstile_rendered || false, error: window._ns_turnstile_error || null };"""
+                )
+                if render_result.get("error"):
+                    log.error(f"turnstile.render() 出错: {render_result['error']}")
+                elif render_result.get("rendered"):
+                    log.info("Turnstile widget 手动渲染成功，等待求解...")
+                time.sleep(2)
 
-            if result and result.get("success"):
-                # 4. 提取浏览器 Cookie
-                cookies = context.cookies()
-                cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
-                browser.close()
-                log.info("账号密码登录成功")
-                return cookie_str
-            else:
-                msg = result.get("message", "未知错误") if result else "无响应"
-                log.error(f"登录失败: {msg}")
-                browser.close()
-                return None
+        # 3. 等待 Turnstile 求解
+        log.info("等待 Turnstile 验证码自动求解...")
+        token = None
+        for i in range(30):  # 最多等待 30 秒
+            time.sleep(1)
+            token = driver.execute_script(
+                """return (function() {
+                    var el = document.querySelector('[name="cf-turnstile-response"]');
+                    if (el && el.value && el.value.length > 10) return el.value;
+                    var widget = document.querySelector('.cf-turnstile');
+                    if (widget) {
+                        var r = widget.getAttribute('data-response');
+                        if (r && r.length > 10) return r;
+                    }
+                    return null;
+                })();"""
+            )
+            if token:
+                log.info(f"Turnstile 验证码求解成功 (等待 {i+1}s)")
+                break
 
-        except Exception as e:
-            log.error(f"浏览器登录异常: {e}")
-            browser.close()
+            # 每 10 秒打印调试状态
+            if (i + 1) % 10 == 0:
+                debug = driver.execute_script(
+                    """return (function() {
+                        var iframes = Array.from(document.querySelectorAll('iframe'));
+                        var cfIframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+                        var turnstileDiv = document.querySelector('.cf-turnstile');
+                        var turnstileInput = document.querySelector('[name="cf-turnstile-response"]');
+                        var hasTurnstile = typeof turnstile !== 'undefined';
+                        return {
+                            iframeCount: iframes.length,
+                            iframeSrcs: iframes.map(f => f.src ? f.src.substring(0, 60) : '(empty)'),
+                            hasCfIframe: !!cfIframe,
+                            hasTurnstileDiv: !!turnstileDiv,
+                            turnstileInputValue: turnstileInput ? turnstileInput.value.substring(0, 20) : null,
+                            turnstileDefined: hasTurnstile,
+                            rendered: window._ns_turnstile_rendered || false
+                        };
+                    })();"""
+                )
+                log.info(f"仍在等待... ({i+1}s) iframes={debug.get('iframeCount')}, cfIframe={debug.get('hasCfIframe')}, turnstileDiv={debug.get('hasTurnstileDiv')}, turnstileDefined={debug.get('turnstileDefined')}, rendered={debug.get('rendered')}, inputVal={debug.get('turnstileInputValue')}")
+
+        # 如果自动求解失败，尝试通过 JS 点击 Turnstile checkbox
+        if not token:
+            log.info("Turnstile 未自动求解，尝试 JS 点击 checkbox...")
+            for attempt in range(3):
+                try:
+                    # 用 JS 直接在页面操作，绕过 Selenium 的 iframe 限制
+                    clicked = driver.execute_script(
+                        """return (function() {
+                            var iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]')
+                                || document.querySelector('iframe[title*="Cloudflare"]')
+                                || document.querySelector('iframe[title*="Widget"]');
+                            if (!iframe) {
+                                // 检查是否有 shadow DOM 或其他容器
+                                var container = document.querySelector('[data-sitekey]') || document.querySelector('.cf-turnstile');
+                                if (container) {
+                                    container.click();
+                                    return 'clicked_container';
+                                }
+                                return 'no_iframe_no_container';
+                            }
+                            // 获取 iframe 位置并点击
+                            var rect = iframe.getBoundingClientRect();
+                            var x = rect.left + 28;
+                            var y = rect.top + rect.height / 2;
+                            // 模拟真实点击
+                            var evt = new MouseEvent('click', {
+                                bubbles: true,
+                                cancelable: true,
+                                clientX: x,
+                                clientY: y
+                            });
+                            iframe.dispatchEvent(evt);
+                            // 也尝试点击 iframe 父容器
+                            if (iframe.parentElement) {
+                                iframe.parentElement.click();
+                            }
+                            return 'clicked_iframe_' + x + '_' + y;
+                        })();"""
+                    )
+                    log.info(f"JS 点击 Turnstile (第 {attempt + 1} 次): {clicked}")
+                    time.sleep(3)
+
+                    # 检查 token
+                    token = driver.execute_script(
+                        """return (function() {
+                            var el = document.querySelector('[name="cf-turnstile-response"]');
+                            if (el && el.value && el.value.length > 10) return el.value;
+                            var widget = document.querySelector('.cf-turnstile');
+                            if (widget) {
+                                var r = widget.getAttribute('data-response');
+                                if (r && r.length > 10) return r;
+                            }
+                            return null;
+                        })();"""
+                    )
+                    if token:
+                        log.info(f"Turnstile 验证码求解成功 (JS 点击后)")
+                        break
+
+                    # 也尝试用 ActionChains 点击 iframe 位置
+                    if not token:
+                        try:
+                            iframe_el = driver.execute_script(
+                                """return document.querySelector('iframe[src*="challenges.cloudflare.com"]');"""
+                            )
+                            if iframe_el:
+                                from selenium.webdriver import ActionChains
+                                actions = ActionChains(driver)
+                                actions.move_to_element_with_offset(iframe_el, 28, 0)
+                                actions.click()
+                                actions.perform()
+                                log.info(f"ActionChains 点击 iframe (第 {attempt + 1} 次)")
+                                time.sleep(3)
+                                token = driver.execute_script(
+                                    """return (function() {
+                                        var el = document.querySelector('[name="cf-turnstile-response"]');
+                                        if (el && el.value && el.value.length > 10) return el.value;
+                                        return null;
+                                    })();"""
+                                )
+                                if token:
+                                    log.info(f"Turnstile 验证码求解成功 (ActionChains 点击后)")
+                                    break
+                        except Exception as e:
+                            log.warning(f"ActionChains 点击失败: {e}")
+                except Exception as e:
+                    log.warning(f"JS 点击 Turnstile 第 {attempt + 1} 次失败: {e}")
+                    time.sleep(2)
+
+        if not token:
+            log.error("Turnstile 验证码求解超时，登录失败")
+            try:
+                driver.save_screenshot_to_logs("debug_turnstile_timeout.png")
+                log.info("已保存超时截图")
+            except Exception:
+                pass
+            driver.quit()
             return None
+
+        # 4. 在浏览器内调用登录 API（必须用 execute_async_script 等待 fetch 完成）
+        log.info("调用登录接口...")
+        result = driver.execute_async_script(
+            """const callback = arguments[arguments.length - 1];
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 25000);
+            fetch(arguments[0], {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Captcha-Token': arguments[3],
+                    'X-Captcha-Source': 'turnstile'
+                },
+                body: JSON.stringify({
+                    username: arguments[1],
+                    password: arguments[2]
+                }),
+                signal: controller.signal
+            })
+            .then(r => r.text().then(text => {
+                clearTimeout(timeoutId);
+                let data;
+                try { data = JSON.parse(text); }
+                catch(e) {
+                    return callback({
+                        success: false,
+                        message: '响应非JSON (HTTP ' + r.status + '): ' + text.substring(0, 200),
+                        _status: r.status,
+                        _raw: text.substring(0, 500)
+                    });
+                }
+                data._status = r.status;
+                callback(data);
+            }))
+            .catch(e => {
+                clearTimeout(timeoutId);
+                callback({ success: false, message: 'fetch错误: ' + e.toString() });
+            });""",
+            LOGIN_API,
+            username,
+            password,
+            token,
+        )
+
+        if result and result.get("success"):
+            # 5. 导航到主页，等待 Cloudflare 验证通过后用 CDP Fetch 签到
+            driver.get(BOARD_PAGE)
+            log.info("等待 Cloudflare 验证通过...")
+            for i in range(15):
+                time.sleep(2)
+                title = driver.title or ""
+                if "just a moment" not in title.lower() and "checking" not in title.lower():
+                    log.info(f"页面加载完成: {title}")
+                    break
+            else:
+                log.warning("Cloudflare 验证可能未通过")
+            # 6. 签到：完全复刻 NodeSeek X 官方签到逻辑
+            # net.post('/api/attendance?random=true') => fetch(url, { method:'POST', credentials:'include' })
+            try:
+                sign_result = driver.execute_async_script(
+                    """const callback = arguments[arguments.length - 1];
+                    fetch(arguments[0], {
+                        method: 'POST',
+                        credentials: 'include'
+                    })
+                    .then(r => r.json().then(data => {
+                        data._status = r.status;
+                        callback(data);
+                    }))
+                    .catch(e => {
+                        callback({ success: false, message: 'fetch错误: ' + e.toString() });
+                    });""",
+                    f"{ATTENDANCE_API}?random={random_mode}",
+                )
+            except Exception as e:
+                log.warning(f"浏览器签到异常: {e}")
+                sign_result = {"success": False, "message": str(e)}
+            log.info(f"浏览器内签到结果: {sign_result}")
+            # 7. 提取浏览器 Cookie（包含 cf_clearance）
+            cookies = driver.get_cookies()
+            cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+            driver.quit()
+            log.info("账号密码登录成功")
+            return cookie_str, sign_result
+        else:
+            msg = result.get("message", "未知错误") if result else "无响应"
+            status_code = result.get("_status") if result else None
+            log.error(f"登录失败: {msg}" + (f" (HTTP {status_code})" if status_code else ""))
+            driver.quit()
+            return None, None
+
+    except Exception as e:
+        log.error(f"浏览器登录异常: {e}")
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+        return None, None
 
 
 # ==================== 签到 ====================
-def sign_in(cookie, random_mode="true"):
+def sign_in(cookie, random_mode="true", proxy=""):
     """
     执行签到操作
     :param cookie: NodeSeek Cookie 字符串
     :param random_mode: "true"=随机签到(1~N鸡腿), "false"=固定签到(鸡腿x5)
+    :param proxy: 代理地址（可选）
     :return: (status, message) status: success/already/invalid/fail/error
     """
     headers = {
@@ -220,8 +540,21 @@ def sign_in(cookie, random_mode="true"):
     url = f"{ATTENDANCE_API}?random={random_mode}"
 
     try:
-        resp = requests.post(url, headers=headers, impersonate="chrome110", timeout=30)
-        data = resp.json()
+        kwargs = dict(headers=headers, impersonate="chrome", timeout=30)
+        if proxy:
+            kwargs["proxy"] = proxy
+        log.info(f"签到请求: POST {url}, random={random_mode}, proxy={'有' if proxy else '无'}")
+        resp = requests.post(url, **kwargs)
+        log.info(f"签到响应: HTTP {resp.status_code}")
+        # Cloudflare 拦截：POST 被降级为 GET
+        if resp.status_code == 404 and "Cannot GET" in resp.text:
+            log.error("Cloudflare 拦截：POST 请求被转为 GET")
+            return "error", "Cloudflare 拦截: POST 被转为 GET"
+        try:
+            data = resp.json()
+        except Exception:
+            log.error(f"签到请求返回非JSON (HTTP {resp.status_code}): {resp.text[:200]}")
+            return "error", f"HTTP {resp.status_code}: 响应非JSON"
         message = data.get("message", "")
         success = data.get("success", False)
 
@@ -345,6 +678,12 @@ def main():
     updated_cookies = []
     cookie_changed = False
 
+    # 检测代理（签到请求也需要代理才能访问 nodeseek.com）
+    sign_proxy = ""
+    raw_proxy = _detect_system_proxy()
+    if raw_proxy:
+        sign_proxy = _test_proxy_for_cloudflare(raw_proxy) or ""
+
     for idx, acc in enumerate(accounts):
         log.info(f"\n--- 账号 {idx + 1}/{len(accounts)} ---")
 
@@ -356,15 +695,47 @@ def main():
 
         cookie = acc["cookie"]
 
-        # 如果没有 Cookie 但有账号密码，尝试登录
+        # 如果没有 Cookie 但有账号密码，尝试登录并在浏览器内签到
         if not cookie and acc["username"] and acc["password"]:
             log.info("无 Cookie，使用账号密码登录...")
-            cookie = login_with_credentials(acc["username"], acc["password"])
-            if not cookie:
+            login_result = login_with_credentials(acc["username"], acc["password"], ns_random)
+            if not login_result or not login_result[0]:
                 results.append(f"账号{idx + 1}: 登录失败")
                 continue
+            cookie = login_result[0]
+            browser_sign = login_result[1]
             updated_cookies.append(cookie)
             cookie_changed = True
+
+            # 使用浏览器内签到结果
+            if browser_sign and browser_sign.get("success"):
+                msg = browser_sign.get("message", "签到成功")
+                log.info(f"签到成功: {msg}")
+                results.append(f"账号{idx + 1}: 签到成功 - {msg}")
+            elif browser_sign and "已完成签到" in browser_sign.get("message", ""):
+                msg = browser_sign.get("message", "今日已签到")
+                log.info(f"今日已签到: {msg}")
+                results.append(f"账号{idx + 1}: 今日已签到 - {msg}")
+            elif browser_sign:
+                msg = browser_sign.get("message", "签到失败")
+                log.warning(f"浏览器签到失败: {msg}，尝试 curl_cffi 签到...")
+                status, message = sign_in(cookie, ns_random, sign_proxy)
+                if status == "success":
+                    results.append(f"账号{idx + 1}: 签到成功 - {message}")
+                elif status == "already":
+                    results.append(f"账号{idx + 1}: 今日已签到 - {message}")
+                else:
+                    results.append(f"账号{idx + 1}: 签到失败 - {message}")
+            else:
+                log.error("浏览器签到无响应，尝试 curl_cffi 签到...")
+                status, message = sign_in(cookie, ns_random, sign_proxy)
+                if status == "success":
+                    results.append(f"账号{idx + 1}: 签到成功 - {message}")
+                elif status == "already":
+                    results.append(f"账号{idx + 1}: 今日已签到 - {message}")
+                else:
+                    results.append(f"账号{idx + 1}: 签到失败 - {message}")
+            continue
         elif not cookie:
             results.append(f"账号{idx + 1}: 无 Cookie 且无账号密码配置")
             continue
@@ -372,7 +743,7 @@ def main():
             updated_cookies.append(cookie)
 
         # 执行签到
-        status, message = sign_in(cookie, ns_random)
+        status, message = sign_in(cookie, ns_random, sign_proxy)
 
         if status == "success":
             log.info(f"签到成功: {message}")
@@ -385,17 +756,18 @@ def main():
             # Cookie 失效时尝试重新登录
             if acc["username"] and acc["password"]:
                 log.info("Cookie 失效，尝试重新登录...")
-                new_cookie = login_with_credentials(acc["username"], acc["password"])
-                if new_cookie:
+                login_result = login_with_credentials(acc["username"], acc["password"], ns_random)
+                if login_result and login_result[0]:
+                    new_cookie = login_result[0]
+                    browser_sign = login_result[1]
                     updated_cookies[-1] = new_cookie
                     cookie_changed = True
-                    status, message = sign_in(new_cookie, ns_random)
-                    if status == "success":
-                        results.append(f"账号{idx + 1}: 重新登录后签到成功 - {message}")
-                    elif status == "already":
-                        results.append(f"账号{idx + 1}: 重新登录后今日已签到 - {message}")
+                    if browser_sign and browser_sign.get("success"):
+                        results.append(f"账号{idx + 1}: 重新登录后签到成功 - {browser_sign.get('message', '')}")
+                    elif browser_sign and "已完成签到" in browser_sign.get("message", ""):
+                        results.append(f"账号{idx + 1}: 重新登录后今日已签到 - {browser_sign.get('message', '')}")
                     else:
-                        results.append(f"账号{idx + 1}: 重新登录后签到失败 - {message}")
+                        results.append(f"账号{idx + 1}: 重新登录后签到失败 - {browser_sign.get('message', '未知') if browser_sign else '无响应'}")
                 else:
                     results.append(f"账号{idx + 1}: Cookie 失效且重新登录失败")
             else:
