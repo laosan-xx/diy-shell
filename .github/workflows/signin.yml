@@ -23,46 +23,37 @@ jobs:
       - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r nodeseek-signin/requirements.txt
 
       - name: 执行签到
         env:
           # ===== 签到配置 =====
-          # 签到模式：true=随机签到(1~N鸡腿), false=固定签到(鸡腿x5)
           NS_RANDOM: ${{ vars.NS_RANDOM }}
-          # 随机延迟范围（秒），格式 "最小-最大"，留空则使用默认 0-300
           NS_DELAY: ${{ vars.NS_DELAY }}
-          # 浏览器 headless 模式：true=无头模式, false=有头模式（需 xvfb）
           NS_HEADLESS: ${{ vars.NS_HEADLESS }}
-          # 浏览器代理（challenges.cloudflare.com 在国内被墙，账号密码登录需要代理）
           NS_PROXY: ${{ secrets.NS_PROXY }}
 
           # ===== 登录方式一：Cookie（推荐）=====
-          # 多账号用 & 分隔
           NS_COOKIE: ${{ secrets.NS_COOKIE }}
 
           # ===== 登录方式二：账号密码 =====
-          # 多账号用 & 分隔
           NS_USERNAME: ${{ secrets.NS_USERNAME }}
           NS_PASSWORD: ${{ secrets.NS_PASSWORD }}
 
           # ===== Telegram 通知（可选）=====
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          # TG API 地址（可选，用于反代）
           TG_API_URL: ${{ secrets.TG_API_URL }}
 
           # ===== GitHub 变量自动更新（可选）=====
-          # 需要 repo 权限的 PAT
           GH_PAT: ${{ secrets.GH_PAT }}
           GITHUB_REPOSITORY: ${{ github.repository }}
 
       - name: 执行签到脚本
         run: |
-          # 如果 NS_HEADLESS=false，使用 xvfb 虚拟显示运行有头浏览器
           if [ "${NS_HEADLESS}" = "false" ]; then
             sudo apt-get install -y xvfb
-            xvfb-run python nodeseek_sign.py
+            xvfb-run python nodeseek-signin/nodeseek_sign.py
           else
-            python nodeseek_sign.py
+            python nodeseek-signin/nodeseek_sign.py
           fi
