@@ -82,18 +82,49 @@ def send_telegram(message):
 
 
 # ==================== 账号密码登录（SeleniumBase UC 模式求解 Turnstile）====================
+def _enrich_proxy_auth(proxy_url):
+    """
+    如果代理是 SOCKS 类型且未包含认证信息，从 NS_PROXY_USER / NS_PROXY_PASS 环境变量补充
+    支持格式: socks5://user:pass@host:port, socks5h://user:pass@host:port
+    """
+    if not proxy_url:
+        return proxy_url
+
+    # 已经包含认证信息（@ 在 host:port 之前）
+    if "@" in proxy_url:
+        return proxy_url
+
+    # 仅对 socks 代理补充认证
+    lower = proxy_url.lower()
+    if not (lower.startswith("socks5") or lower.startswith("socks4")):
+        return proxy_url
+
+    user = get_env("NS_PROXY_USER", "")
+    passwd = get_env("NS_PROXY_PASS", "")
+    if not user:
+        return proxy_url
+
+    # 解析 scheme://host:port
+    if "://" in proxy_url:
+        scheme, rest = proxy_url.split("://", 1)
+        return f"{scheme}://{user}:{passwd}@{rest}"
+    else:
+        # 无 scheme 的情况（不太可能但做防御）
+        return f"socks5://{user}:{passwd}@{proxy_url}"
+
+
 def _detect_system_proxy():
-    """自动检测系统代理设置（Windows）"""
+    """自动检测系统代理设置（Windows），自动为 SOCKS 代理补充用户名密码"""
     # 1. 环境变量 NS_PROXY 优先
     proxy = get_env("NS_PROXY", "")
     if proxy:
-        return proxy
+        return _enrich_proxy_auth(proxy)
 
     # 2. 检测常见的系统代理环境变量
     for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"):
         val = os.environ.get(var, "")
         if val and val.strip():
-            return val.strip()
+            return _enrich_proxy_auth(val.strip())
 
     # 3. Windows: 从注册表读取系统代理设置
     if sys.platform == "win32":
@@ -114,11 +145,11 @@ def _detect_system_proxy():
                                 addr = part.split("=", 1)[1]
                                 if not addr.startswith("http"):
                                     addr = "http://" + addr
-                                return addr
+                                return _enrich_proxy_auth(addr)
                     else:
                         if not proxy_server.startswith("http"):
                             proxy_server = "http://" + proxy_server
-                        return proxy_server
+                        return _enrich_proxy_auth(proxy_server)
             winreg.CloseKey(key)
         except Exception:
             pass
