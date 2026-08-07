@@ -31,9 +31,9 @@ done
 DOWNLOAD_PROXY="${DOWNLOAD_PROXY:-https://gh.2026178.xyz}"
 # ---- 与代码 client/command_builtin.go repoMapping 一致 ----
 # key(target 子串) -> GitHub API releases 基础地址
-QUALCOMMAX_REPO="https://api.github.com/repos/laosan-xx/OpenWRT-CI-VIKINGYFY"
+QUALCOMMAX_REPO="https://gh.2026178.xyz/api/repos/laosan-xx/OpenWRT-CI-VIKINGYFY"
 IPQ60_REPO="$QUALCOMMAX_REPO"
-MEDIATEK_REPO="https://api.github.com/repos/laosan-xx/CloseWRT-CI"
+MEDIATEK_REPO="https://gh.2026178.xyz/api/repos/laosan-xx/CloseWRT-CI"
 FILOGIC_REPO="$MEDIATEK_REPO"
 
 log()  { echo "[sysupdate] $*"; }
