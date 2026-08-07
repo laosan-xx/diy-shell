@@ -1,6 +1,6 @@
 #!/bin/sh
 # os-update.sh —— OpenWrt 在线系统更新脚本 (修复版)
-# 修复: awk RS 切分导致 name/url/size 字段错位, sysupgrade 固件被 size 误杀的 bug
+# 修复: awk 解析 GitHub API JSON 时 size 字段错位导致 sysupgrade 被误杀
 #
 # 用法:
 #   sh os-update.sh          交互式: 检测 -> 选固件 -> 下载 -> 确认刷写
@@ -109,59 +109,55 @@ RAW=$(eval "$FETCH" "$API_URL" 2>/dev/null) || {
 # ---- 修复核心 ----
 # 原脚本用 RS="\"browser_download_url\"" 切分 JSON, 但 GitHub API asset 对象
 # 字段顺序为 name -> size -> ... -> browser_download_url (最后一个字段),
-# 导致 RS 切分后: 块 N 的 URL 属于 asset[N-1], 而块内的 name/size 属于 asset[N].
+# 导致 RS 切分后: 块 N 的 URL 属于 asset[N-1], 而块内的 size 属于 asset[N].
 # 结果 sysupgrade 固件的 size 被错读为下一个 asset (manifest, ~14KB) 的 size,
-# 被 >30MB 规则误杀; factory 固件反而拿到 sysupgrade 的 size 通过了检查.
+# 被 >30MB 规则误杀.
 #
-# 修复: 改用 RS=",[[:space:]]*\{" 按 JSON 对象边界切分, 确保 name/size/url
-# 在同一记录块内. 同时 url/size 改用 match()+substr 精确提取, 不再依赖
-# 块开头的位置假设. 兼容 pretty-printed 和紧凑两种 JSON 格式.
+# 修复: 保留 RS 不变 (BusyBox awk 兼容), 但不再依赖 size 字段做过滤;
+# 改用文件扩展名 .bin 判断是否为固件 (manifest/txt 等非固件文件自然排除).
+# 同时去掉 size 输出列, 避免 size 错位导致显示误导.
+# 候选列表: 每行 = branch<TAB>name<TAB>url (3 列)
 CAND=$(mktemp)
 echo "$RAW" | awk -v bm="$BOARD_MODEL" -v dp="$DOWNLOAD_PROXY" -v OFS="\t" '
-BEGIN { RS=",[[:space:]]*\{"; cur_branch="default"; }
+BEGIN { RS="\"browser_download_url\""; cur_branch="default"; }
 {
     blk = $0
     # 1) 若本块含 release 发布名(含 -LAOSAN-), 更新当前 branch
-    if (match(blk, /"name"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+    m = match(blk, /"name"[[:space:]]*:[[:space:]]*"[^"]*"/)
+    if (m) {
         nn = substr(blk, RSTART, RLENGTH)
         gsub(/.*"name"[[:space:]]*:[[:space:]]*"/, "", nn)
         gsub(/".*/, "", nn)
         if (nn ~ /-LAOSAN-/) {
             b = nn
-            sub(/.*-LAOSAN-/, "", b)
-            sub(/-.*/, "", b)
+            sub(/.*-LAOSAN-/, "", b)   # -> main-26.08.06-...
+            sub(/-.*/, "", b)          # -> main
             if (b != "") cur_branch = b
         }
     }
-    # 2) 精确提取 browser_download_url (用 match 而非块开头假设)
-    if (!match(blk, /"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]*"/)) next
-    url = substr(blk, RSTART, RLENGTH)
-    gsub(/.*"browser_download_url"[[:space:]]*:[[:space:]]*"/, "", url)
-    gsub(/".*/, "", url)
+    # 2) 本块开头即为某个 asset 的 browser_download_url
+    url = blk
+    gsub(/^[^:]*:[[:space:]]*"/, "", url); gsub(/".*/, "", url)
     if (url == "") next
+    # 关键: 显示名直接取 URL 的 basename, 与下载地址 100% 同源
     name = url
     sub(/^.*\//, "", name)
     ln = tolower(name)
-    # 3) 过滤: 必须含 board_model; 排除 factory / rootfs
+    # 3) 过滤: 必须含 board_model; 排除 factory / rootfs 等非升级镜像
     if (index(name, bm) == 0) next
     if (index(ln, "factory") > 0) next
     if (index(ln, "rootfs") > 0) next
-    # 4) size 精确提取 (同一块内, 不会再错位)
-    size = 0
-    if (match(blk, /"size"[[:space:]]*:[[:space:]]*[0-9]+/)) {
-        ss = substr(blk, RSTART, RLENGTH)
-        gsub(/.*:[[:space:]]*/, "", ss); size = ss + 0
-    }
-    if (size <= 30*1024*1024) next
-    # 5) 重写下载地址到代理
+    # 4) 用 .bin 扩展名过滤掉 manifest/txt 等非固件文件 (替代原 size>30MB 判断)
+    if (index(ln, ".bin") == 0) next
+    # 5) 重写下载地址到代理, 输出
     dl = url
     sub(/^https:\/\/github.com\//, dp "/", dl)
-    print cur_branch, name, dl, size
+    print cur_branch, name, dl
 }
 ' | sort -ru > "$CAND"
 
 if [ ! -s "$CAND" ]; then
-    err "未找到匹配 $BOARD_MODEL 的固件 (排除 factory 且 >30MB)"
+    err "未找到匹配 $BOARD_MODEL 的固件 (排除 factory, 仅 .bin)"
     rm -f "$CAND"
     exit 1
 fi
@@ -211,9 +207,8 @@ FILES=$(mktemp)
 awk -F'\t' -v x="$SEL_BRANCH" '$1==x' "$CAND" > "$FILES"
 log "  该分支可用固件:"
 j=1
-while IFS=$(printf '\t') read -r _br nm dl sz; do
-    mb=$(( sz / 1024 / 1024 ))
-    log "    [$j] $nm  (${mb}MB)"
+while IFS=$(printf '\t') read -r _br nm dl; do
+    log "    [$j] $nm"
     j=$((j+1))
 done < "$FILES"
 
