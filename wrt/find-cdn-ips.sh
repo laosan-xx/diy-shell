@@ -9,12 +9,14 @@ MAX_JOBS=20            # 并发进程数
 echo "请选择要测试的域名:"
 echo "  1) family.081112.cn"
 echo "  2) video.081112.cn"
-echo "  3) 自定义"
+echo "  3) test123.081112.cn"
+echo "  4) 自定义"
 read -p "请输入序号（默认 1）: " DOMAIN_CHOICE
 
 case "${DOMAIN_CHOICE:-1}" in
     2) DOMAIN="video.081112.cn" ;;
-    3)
+    3) DOMAIN="test123.081112.cn" ;;
+    4)
         read -p "请输入自定义域名: " DOMAIN
         ;;
     *) DOMAIN="family.081112.cn" ;;
