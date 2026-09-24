@@ -2,6 +2,18 @@
 // 未登录 API 限流 60 次/小时/IP，缓存默认 1 小时以大幅降低请求。
 
 const API = 'https://api.github.com'
+// GitHub 代理 gh.2026178.xyz 用法（见仓库 wrt/ 下脚本）：把 GitHub 子域映射到路径前缀
+//   https://api.github.com/X            -> https://gh.2026178.xyz/api/X
+//   https://raw.githubusercontent.com/X -> https://gh.2026178.xyz/raw/X
+//   https://github.com/X               -> https://gh.2026178.xyz/X（下载，见 withProxy）
+// 置空 PROXY（= ''）即恢复直连。
+const PROXY = 'https://gh.2026178.xyz'
+function proxify(url) {
+  if (!PROXY) return url
+  return url
+    .replace(/^https:\/\/api\.github\.com/i, `${PROXY}/api`)
+    .replace(/^https:\/\/raw\.githubusercontent\.com/i, `${PROXY}/raw`)
+}
 const CACHE_TTL = 60 * 60 * 1000 // 1 小时
 const CACHE_PREFIX = 'ghcache:'
 
@@ -21,18 +33,29 @@ async function cachedFetch(path) {
     /* 忽略缓存读取错误 */
   }
 
-  const res = await fetch(`${API}${path}`, {
-    headers: { Accept: 'application/vnd.github+json' },
-  })
-  if (!res.ok) throw new Error(`GitHub API ${res.status} @ ${path}`)
-  const data = await res.json()
-
-  try {
-    localStorage.setItem(key, JSON.stringify({ t: Date.now(), data }))
-  } catch (e) {
-    /* 忽略写入错误（如隐私模式） */
+  const target = `${API}${path}`
+  const candidates = PROXY ? [proxify(target), target] : [target]
+  let lastErr
+  for (const url of candidates) {
+    try {
+      const res = await fetch(url, {
+        headers: { Accept: 'application/vnd.github+json' },
+      })
+      if (res.ok) {
+        const data = await res.json()
+        try {
+          localStorage.setItem(key, JSON.stringify({ t: Date.now(), data }))
+        } catch (e) {
+          /* 忽略写入错误（如隐私模式） */
+        }
+        return data
+      }
+      lastErr = new Error(`GitHub API ${res.status} @ ${path}`)
+    } catch (e) {
+      lastErr = e
+    }
   }
-  return data
+  throw lastErr || new Error(`GitHub API failed @ ${path}`)
 }
 
 export async function getRepo(owner, repo) {
@@ -49,11 +72,19 @@ export async function getLatestRelease(owner, repo) {
 }
 
 export async function getReadme(owner, repo, branch = 'main') {
-  const res = await fetch(
-    `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/README.md`,
-  )
-  if (!res.ok) throw new Error(`README ${res.status}`)
-  return await res.text()
+  const target = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/README.md`
+  const candidates = PROXY ? [proxify(target), target] : [target]
+  let lastErr
+  for (const url of candidates) {
+    try {
+      const res = await fetch(url)
+      if (res.ok) return await res.text()
+      lastErr = new Error(`README ${res.status}`)
+    } catch (e) {
+      lastErr = e
+    }
+  }
+  throw lastErr || new Error('README fetch failed')
 }
 
 // 把 JSON 里的基础工具信息，补全为包含 GitHub 实时数据的完整对象
