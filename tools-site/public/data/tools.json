@@ -1,0 +1,40 @@
+{
+  "proxy": {
+    "domain": "gh.2026178.xyz"
+  },
+  "tools": [
+    {
+      "id": "v2rayN",
+      "repo": "2dust/v2rayN",
+      "platform": ["Windows"],
+      "name": "v2rayN",
+      "assetMatch": ["windows-64", "macos-64"],
+      "manual": "## v2rayN 操作手册（手动维护）\n\n1. 从上方下载并解压最新版压缩包。\n2. 双击 `v2rayN.exe` 启动（首次运行若提示，请允许防火墙）。\n3. 点击「订阅」→「订阅设置」，添加你的订阅链接。\n4. 更新订阅后，右键托盘图标选择「路由模式」并连接节点即可。\n\n> 占位文案，请替换为你的真实手册内容（也可把本字段改成 `\"readme\": true` 来自动使用仓库 README）。",
+      "videos": [
+        {
+          "title": "v2rayN 配置教程（示例外链，请替换为你的视频地址）",
+          "type": "iframe",
+          "url": "https://player.bilibili.com/player.html?bvid=BV1GJ411x7h7&page=1"
+        }
+      ]
+    },
+    {
+      "id": "v2rayNG",
+      "repo": "2dust/v2rayNG",
+      "platform": ["Android"],
+      "name": "v2rayNG",
+      "assetMatch": ["arm64-v8a"],
+      "manual": "## v2rayNG 操作手册（手动维护）\n\n1. 下载 APK 并安装（如提示未知来源，请在系统中允许）。\n2. 打开应用，点击右上角「+」→「订阅设置」添加订阅。\n3. 返回主界面，点击底部「更新订阅」。\n4. 选择一个节点，点击右下角开关连接。\n\n> 占位文案，请按需替换。",
+      "videos": []
+    },
+    {
+      "id": "NekoBox-Android",
+      "repo": "MatsuriDayo/NekoBoxForAndroid",
+      "platform": ["Android"],
+      "name": "NekoBox (Android)",
+      "assetMatch": ["arm64-v8a"],
+      "manual": "## NekoBox for Android 操作手册（手动维护）\n\n1. 安装 APK 后打开。\n2. 导入订阅或配置，选择节点连接。\n\n> 占位文案，请按需替换。",
+      "videos": []
+    }
+  ]
+}
