@@ -62,13 +62,25 @@ export async function getRepo(owner, repo) {
   return cachedFetch(`/repos/${owner}/${repo}`)
 }
 
-// 拉取 release 列表（含 pre-release，按发布时间倒序，第一条最新）。
-// 优先返回最新的 pre-release；若仓库没有 pre-release，则回退到最新正式版。
-export async function getLatestRelease(owner, repo) {
+// 拉取 release 列表（含 pre-release）。
+// 注意：GitHub /releases 接口默认就包含 pre-release，只排除 draft，
+// 因此这里「不管是不是 pre-release」无需额外处理，二者都会进入列表。
+// 返回按发布时间倒序的数组，list[0] 即最新一条。
+export async function getReleases(owner, repo) {
   const list = await cachedFetch(`/repos/${owner}/${repo}/releases?per_page=30`)
-  if (!Array.isArray(list) || !list.length) return null
-  const pre = list.find((r) => r.prerelease)
-  return pre || list[0]
+  if (!Array.isArray(list) || !list.length) return []
+  // 按发布时间倒序；published_at 为空时回退到 created_at
+  return list.slice().sort(
+    (a, b) =>
+      new Date(b.published_at || b.created_at) -
+      new Date(a.published_at || a.created_at),
+  )
+}
+
+// 取最新的一条 release（不再区分 pre-release / 正式版，统一按发布时间取最新）。
+export async function getLatestRelease(owner, repo) {
+  const list = await getReleases(owner, repo)
+  return list.length ? list[0] : null
 }
 
 export async function getReadme(owner, repo, branch = 'main') {
