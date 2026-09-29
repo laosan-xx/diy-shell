@@ -34,7 +34,7 @@
 set -u
 
 REPO_OWNER="laosan-xx"
-REPO_NAME="frp"
+REPO_NAME="my-frp"
 
 # ---- 可调参数（命令行可覆盖）---------------------------------------------
 TARGET_VERSION=""          # 空 = 最新
