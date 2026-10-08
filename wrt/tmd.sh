@@ -1,11 +1,13 @@
 #!/bin/sh
-# tmd - 在线脚本
-# 运行脚本列表与脚本按需从 GitHub 拉取，本体更新改为手动。
+# tmd - 在线脚本（带本地缓存，避免每次联网）
 # 适用于 OpenWRT（busybox ash）。
 #
 # 安装：由 OpenWRT-CI 编译流程从目标仓库下载并装入 /usr/bin/tmd。
-# 更新策略（方案 1 + 方案 4）：
-#   - 启动时完全不联网检查本体，直接进入脚本菜单。
+# 缓存策略：
+#   - 脚本列表（目录 Contents API）缓存到本地，默认 10 分钟内复用，不重复联网。
+#   - 选中的脚本也缓存到本地，已缓存则直接运行，缺失才下载。
+#   - `tmd refresh` 强制刷新列表缓存；`tmd run <名>` 直接运行（离线优先）。
+# 本体更新策略：
 #   - `tmd check`  轻量比对：仅拉取 API 中的 sha，与本地记录比对，不下本体。
 #   - `tmd update` 真正下载并覆盖本体，并写回新的 sha。
 # 本地 sha 记录存于 SELF_SHA 文件，由 update 建立/刷新。
@@ -26,6 +28,12 @@ SELF_REMOTE="${RAW_BASE}/tmd.sh"
 # 记录已安装本体 sha 的文件（与 SELF 同目录）
 SELF_SHA="${SELF}.sha"
 
+# 本地缓存（tmpfs，重启即清；同一运行期内复用可显著提速）
+CACHE_DIR="/tmp/tmd.d"
+INDEX="${CACHE_DIR}/index"
+SCRIPTS="${CACHE_DIR}/scripts"
+CACHE_TTL=600   # 列表缓存有效期（秒），默认 10 分钟
+
 # 选择可用的下载器
 if command -v uclient-fetch >/dev/null 2>&1; then
     FETCH="uclient-fetch -q -O -"
@@ -38,14 +46,6 @@ else
     exit 1
 fi
 
-# 获取远程 tmd.sh 的 Git blob sha（来自 Contents API，仅几百字节）
-get_remote_self_sha() {
-    $FETCH "${API_URL}" 2>/dev/null \
-        | grep -o '"name": *"tmd\.sh"[^}]*' \
-        | grep -o '"sha": *"[^"]*"' \
-        | head -n1 | sed 's/"sha": *"//; s/"$//'
-}
-
 # 从单文件 Contents API 直接拿到某文件的 sha（通用）
 # $1 = 文件名；请求 .../contents/wrt/<文件名>?ref=<分支>
 get_file_sha() {
@@ -53,6 +53,70 @@ get_file_sha() {
     $FETCH "$url" 2>/dev/null \
         | grep -o '"sha": *"[^"]*"' \
         | head -n1 | sed 's/"sha": *"//; s/"$//'
+}
+
+# ---------- 本地缓存：列表 + 脚本 ----------
+# 解析目录 Contents API 的 JSON，逐行输出 "name<TAB>sha"（排除 tmd.sh）
+parse_index() {
+    grep -o '"name": *"[^"]*\.sh"[^}]*' \
+    | while IFS= read -r obj; do
+        name=$(echo "$obj" | sed -n 's/.*"name": *"\([^"]*\)".*/\1/p')
+        sha=$(echo "$obj" | sed -n 's/.*"sha": *"\([^"]*\)".*/\1/p')
+        [ "$name" = "tmd.sh" ] && continue
+        [ -n "$name" ] && printf '%s\t%s\n' "$name" "$sha"
+    done
+}
+
+# 拉取并刷新脚本列表缓存；成功返回 0
+fetch_index() {
+    local json
+    json=$($FETCH "$API_URL" 2>/dev/null)
+    if [ -z "$json" ]; then
+        return 1
+    fi
+    mkdir -p "$CACHE_DIR" "$SCRIPTS"
+    {
+        echo "#ts $(date +%s)"
+        echo "$json" | parse_index
+    } > "${INDEX}.tmp" && mv -f "${INDEX}.tmp" "$INDEX" || return 1
+    # 列表已更新，脚本缓存失效，清除以便按需重新下载
+    rm -rf "$SCRIPTS"; mkdir -p "$SCRIPTS"
+    return 0
+}
+
+# 列表缓存是否有效（存在且未超过 TTL）
+cache_valid() {
+    [ -f "$INDEX" ] || return 1
+    local now ts
+    now=$(date +%s)
+    ts=$(sed -n 's/^#ts //p' "$INDEX" | head -n1)
+    [ -n "$ts" ] || return 1
+    [ "$((now - ts))" -lt "$CACHE_TTL" ]
+}
+
+# 从缓存读取脚本名列表（每行一个，跳过 # 头）
+load_names() {
+    sed -e '/^#/d' -e 's/\t.*//' "$INDEX"
+}
+
+# 运行指定脚本：优先用本地缓存，缺失才下载
+run_named() {
+    local name="$1"
+    local cached="$SCRIPTS/$name"
+    if [ ! -s "$cached" ]; then
+        echo "正在下载脚本: $name"
+        mkdir -p "$SCRIPTS"
+        $FETCH "${RAW_BASE}/${name}" > "$cached" 2>/dev/null
+    fi
+    if [ ! -s "$cached" ]; then
+        echo "错误：脚本不可用（网络问题或文件不存在）: $name" >&2
+        rm -f "$cached"
+        return 1
+    fi
+    echo "----------------------------------------"
+    echo "运行: $name"
+    echo "----------------------------------------"
+    sh "$cached"
 }
 
 # 检查更新（轻量，不下本体）：比对远程 sha 与本地记录
@@ -100,23 +164,103 @@ do_update() {
     return 0
 }
 
-# 子命令处理：仅当作为已安装本体运行时，支持 check / update
+# 将 host 解析写入 OpenWRT 的 /etc/hosts
+# 已存在该 host 的旧条目则删除后重写，否则追加
+set_openwrt_host() {
+    local host="$1" ip="$2"
+    local hosts="/etc/hosts"
+    if [ ! -f "$hosts" ]; then
+        echo "错误：找不到 $hosts" >&2
+        return 1
+    fi
+    if [ ! -w "$hosts" ]; then
+        echo "错误：无权限写入 $hosts（请使用 root 运行）。" >&2
+        return 1
+    fi
+    # 转义 host 中的正则元字符，避免 sed 误匹配
+    local esc_host=$(printf '%s' "$host" | sed 's/[][\.*^$/]/\\&/g')
+    # 删除所有以该 host 结尾的旧条目
+    sed -i "/[[:space:]]${esc_host}\$/d" "$hosts"
+    # 追加新条目（IP<TAB>host）
+    printf '%s\t%s\n' "$ip" "$host" >> "$hosts"
+    echo "已写入 hosts: ${ip} ${host}"
+    return 0
+}
+
+# 获取并设置 gh.2026178.xyz 的 hosts 解析
+# 数据源：https://ip.164746.xyz/ipTop.html
+# 返回形如 " 104.16.204.6,104.18.103.125 "，取第一个 IP 写入 /etc/hosts
+do_sethost() {
+    local host="gh.2026178.xyz"
+    local src="https://ip.164746.xyz/ipTop.html"
+    echo "正在获取 ${host} 的可用 IP（来源: ${src}）..."
+    local raw=$($FETCH "$src" 2>/dev/null)
+    if [ -z "$raw" ]; then
+        echo "错误：无法获取 IP 列表: $src" >&2
+        return 1
+    fi
+    # 拆分逗号、去空格/制表/回车，提取首个合法 IPv4
+    local ip=$(echo "$raw" | tr ',' '\n' | tr -d ' \t\r' \
+        | grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | head -n1)
+    if [ -z "$ip" ]; then
+        echo "错误：未从返回中解析到有效 IP，原始返回: $raw" >&2
+        return 1
+    fi
+    echo "解析到首个 IP: $ip"
+    set_openwrt_host "$host" "$ip"
+    return $?
+}
+
+# 恢复：从 /etc/hosts 中删除 gh.2026178.xyz 的条目（撤销 sethost 的效果）
+do_restorehost() {
+    local host="gh.2026178.xyz"
+    local hosts="/etc/hosts"
+    if [ ! -f "$hosts" ]; then
+        echo "错误：找不到 $hosts" >&2
+        return 1
+    fi
+    if [ ! -w "$hosts" ]; then
+        echo "错误：无权限写入 $hosts（请使用 root 运行）。" >&2
+        return 1
+    fi
+    local esc_host=$(printf '%s' "$host" | sed 's/[][\.*^$/]/\\&/g')
+    local before=$(grep -c "[[:space:]]${esc_host}\$" "$hosts" 2>/dev/null || true)
+    sed -i "/[[:space:]]${esc_host}\$/d" "$hosts"
+    if [ "$before" -gt 0 ]; then
+        echo "已清除 ${host} 的 hosts 条目（共 ${before} 条）。"
+    else
+        echo "${host} 在 ${hosts} 中不存在条目，无需恢复。"
+    fi
+    return 0
+}
+
+# 子命令处理：仅当作为已安装本体运行时，支持 check / update / sethost / restore / refresh / run
 if [ "$0" = "$SELF" ]; then
     case "$1" in
-        check)  do_check;  exit $? ;;
-        update) do_update; exit $? ;;
+        check)    do_check;    exit $? ;;
+        update)   do_update;   exit $? ;;
+        sethost)  do_sethost;  exit $? ;;
+        restore)  do_restorehost; exit $? ;;
+        refresh)  fetch_index && echo "脚本列表已刷新。" || { echo "刷新失败（网络问题）。" >&2; exit 1; } ;;
+        run)      shift; if [ -z "$1" ]; then echo "用法: tmd run <脚本名>" >&2; exit 1; fi; run_named "$1"; exit $? ;;
     esac
 fi
 
-echo "正在从 GitHub 获取脚本列表 ..."
-JSON=$($FETCH "$API_URL" 2>/dev/null)
-if [ -z "$JSON" ]; then
+mkdir -p "$CACHE_DIR" "$SCRIPTS"
+
+# 列表优先用本地缓存；缓存过期或不存在才联网刷新；刷新失败则回退缓存
+if cache_valid; then
+    :
+elif fetch_index; then
+    echo "（已刷新脚本列表缓存）"
+elif [ -f "$INDEX" ]; then
+    echo "警告：刷新脚本列表失败，暂用本地缓存（可能已过期）。" >&2
+else
     echo "错误：无法获取脚本列表（网络问题或 GitHub API 限流）。" >&2
     exit 1
 fi
 
-# 提取目录下所有 .sh 文件名（保持 JSON 中的顺序），排除自身
-NAMES=$(echo "$JSON" | grep -o '"name": *"[^"]*\.sh"' | sed 's/"name": *"//; s/"$//' | grep -v '^tmd\.sh$')
+NAMES=$(load_names)
 if [ -z "$NAMES" ]; then
     echo "错误：未在 ${REPO_DIR}/ 下找到任何 .sh 脚本。" >&2
     exit 1
@@ -129,6 +273,8 @@ for n in $NAMES; do
     printf "  %2d) %s\n" "$i" "$n"
     i=$((i+1))
 done
+echo "   h) 设置 gh.2026178.xyz 的 hosts"
+echo "   r) 恢复 gh.2026178.xyz（清除 hosts 条目）"
 echo "   q) 退出"
 echo ""
 printf "请选择要运行的脚本编号: "
@@ -136,6 +282,8 @@ read choice
 
 case "$choice" in
     q|Q) echo "已取消。"; exit 0 ;;
+    h|H) do_sethost; exit $? ;;
+    r|R) do_restorehost; exit $? ;;
     '' ) echo "未选择，退出。"; exit 0 ;;
 esac
 
@@ -146,21 +294,5 @@ if [ -z "$sel" ]; then
     exit 1
 fi
 
-SCRIPT_URL="${RAW_BASE}/${sel}"
-TMP="/tmp/tmd_${sel}.$$"
-
-echo "正在下载脚本: $sel"
-$FETCH "$SCRIPT_URL" > "$TMP" 2>/dev/null
-if [ ! -s "$TMP" ]; then
-    echo "错误：下载脚本失败: $SCRIPT_URL" >&2
-    rm -f "$TMP"
-    exit 1
-fi
-
-echo "----------------------------------------"
-echo "运行: $sel (从 $SCRIPT_URL)"
-echo "----------------------------------------"
-sh "$TMP"
-rc=$?
-rm -f "$TMP"
-exit $rc
+run_named "$sel"
+exit $?
