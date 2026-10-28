@@ -11,6 +11,10 @@
 #   - `tmd check`  轻量比对：仅拉取 API 中的 sha，与本地记录比对，不下本体。
 #   - `tmd update` 真正下载并覆盖本体，并写回新的 sha。
 # 本地 sha 记录存于 SELF_SHA 文件，由 update 建立/刷新。
+# 菜单显示：
+#   - 列表里显示"中文名（真实文件名）"，中文名在 desc_of() 里维护；
+#     新增脚本记得补一行，没登记的会退回显示文件名。
+#   - `tmd run <名>`、编号选择仍以真实文件名为准。
 
 REPO_OWNER="laosan-xx"
 REPO_NAME="diy-shell"
@@ -97,6 +101,23 @@ cache_valid() {
 # 从缓存读取脚本名列表（每行一个，跳过 # 头）
 load_names() {
     sed -e '/^#/d' -e 's/\t.*//' "$INDEX"
+}
+
+# 脚本的中文名（菜单里显示中文，括号内保留真实文件名，`tmd run` 仍用文件名）
+# 新增脚本时在这里补一行；没登记的仍显示文件名
+desc_of() {
+    case "$1" in
+    cf.sh)              printf 'Cloudflare 优选 IP 测速\n' ;;
+    find-cdn-ips.sh)    printf '扫描 CDN 可用 IP 段\n' ;;
+    frpc_update.sh)     printf 'frpc 手动升级\n' ;;
+    ip-change.sh)       printf '公网 IP 变动 Telegram 通知\n' ;;
+    ip_rotate_check.sh) printf 'IP 质量体检 / 不合格自动换 IP\n' ;;
+    nz.sh)              printf '哪吒监控探针安装\n' ;;
+    os-update.sh)       printf 'OpenWrt 在线系统更新\n' ;;
+    proxy-manager.sh)   printf 'OpenClash 安装 / 管理\n' ;;
+    wan_monitor.sh)     printf 'WAN 口断线监测\n' ;;
+    *)                  printf '\n' ;;
+    esac
 }
 
 # 运行指定脚本：优先用本地缓存，缺失才下载
@@ -270,7 +291,12 @@ echo ""
 echo "=== TMD 常用脚本 ==="
 i=1
 for n in $NAMES; do
-    printf "  %2d) %s\n" "$i" "$n"
+    desc=$(desc_of "$n")
+    if [ -n "$desc" ]; then
+        printf "  %2d) %s（%s）\n" "$i" "$desc" "$n"
+    else
+        printf "  %2d) %s\n" "$i" "$n"
+    fi
     i=$((i+1))
 done
 echo "   h) 设置 gh.2026178.xyz 的 hosts"
