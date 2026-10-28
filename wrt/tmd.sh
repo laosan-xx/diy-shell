@@ -135,6 +135,7 @@ fetch_index() {
 
     {
         echo "#ts $(date +%s)"
+        echo "#v2" # 索引版本：带 #v2 才表示 desc 列已抓取过，旧缓存据此判废
         while IFS="$TAB" read -r name sha desc; do
             [ -z "$name" ] && continue
             if [ "$desc" = "__FETCH__" ] || [ "$desc" = "__RETRY__" ]; then
@@ -158,10 +159,12 @@ fetch_index() {
     return 0
 }
 
-# 列表缓存是否有效（存在且未超过 TTL）
+# 列表缓存是否有效（存在、是带 desc 列的新格式、且未超过 TTL）
 cache_valid() {
     [ -f "$INDEX" ] || return 1
     local now ts
+    # 旧格式索引（没有中文名列）判废，否则升级后菜单会一直是裸文件名
+    grep -qx '#v2' "$INDEX" 2>/dev/null || return 1
     now=$(date +%s)
     ts=$(sed -n 's/^#ts //p' "$INDEX" | head -n1)
     [ -n "$ts" ] || return 1
@@ -319,17 +322,17 @@ do_restorehost() {
     return 0
 }
 
-# 子命令处理：仅当作为已安装本体运行时，支持 check / update / sethost / restore / refresh / run
-if [ "$0" = "$SELF" ]; then
-    case "$1" in
-        check)    do_check;    exit $? ;;
-        update)   do_update;   exit $? ;;
-        sethost)  do_sethost;  exit $? ;;
-        restore)  do_restorehost; exit $? ;;
-        refresh)  fetch_index && echo "脚本列表已刷新。" || { echo "刷新失败（网络问题）。" >&2; exit 1; } ;;
-        run)      shift; if [ -z "$1" ]; then echo "用法: tmd run <脚本名>" >&2; exit 1; fi; run_named "$1"; exit $? ;;
-    esac
-fi
+# 子命令处理：check / update / sethost / restore / refresh / run
+# 注意：不能靠 "$0" = "$SELF" 判断 —— 通过 PATH 调用时 $0 是 "tmd" 而不是
+# "/usr/bin/tmd"，那样 tmd update / tmd refresh 会被静默忽略、直接掉进菜单。
+case "$1" in
+    check)    do_check;    exit $? ;;
+    update)   do_update;   exit $? ;;
+    sethost)  do_sethost;  exit $? ;;
+    restore)  do_restorehost; exit $? ;;
+    refresh)  fetch_index && echo "脚本列表已刷新。" || { echo "刷新失败（网络问题）。" >&2; exit 1; } ;;
+    run)      shift; if [ -z "${1:-}" ]; then echo "用法: tmd run <脚本名>" >&2; exit 1; fi; run_named "$1"; exit $? ;;
+esac
 
 mkdir -p "$CACHE_DIR" "$SCRIPTS"
 
@@ -354,15 +357,20 @@ fi
 echo ""
 echo "=== TMD 常用脚本 ==="
 i=1
+named=0
 for n in $NAMES; do
     desc=$(desc_of "$n")
     if [ -n "$desc" ]; then
         printf "  %2d) %s（%s）\n" "$i" "$desc" "$n"
+        named=$((named + 1))
     else
         printf "  %2d) %s\n" "$i" "$n"
     fi
     i=$((i+1))
 done
+if [ "$named" -eq 0 ]; then
+    echo "（中文名未获取：确认 tmd 本体已是最新，并执行 tmd refresh 重试）"
+fi
 echo "   h) 设置 gh.2026178.xyz 的 hosts"
 echo "   r) 恢复 gh.2026178.xyz（清除 hosts 条目）"
 echo "   q) 退出"
