@@ -1,4 +1,5 @@
 #!/bin/sh
+# desc: TMD 脚本菜单（列表 + 本地缓存）
 # tmd - 在线脚本（带本地缓存，避免每次联网）
 # 适用于 OpenWRT（busybox ash）。
 #
@@ -12,8 +13,11 @@
 #   - `tmd update` 真正下载并覆盖本体，并写回新的 sha。
 # 本地 sha 记录存于 SELF_SHA 文件，由 update 建立/刷新。
 # 菜单显示：
-#   - 列表里显示"中文名（真实文件名）"，中文名在 desc_of() 里维护；
-#     新增脚本记得补一行，没登记的会退回显示文件名。
+#   - 列表里显示"中文名（真实文件名）"。中文名优先取脚本自身头部的
+#     "# desc: xxx" 注释（前 4KB 内），刷新列表时抓取并缓存到本地索引，
+#     所以新增脚本只要在头部写一行 desc，不用再回来改 tmd.sh。
+#   - 抓取遵守"sha 没变就复用旧描述"，日常 refresh 不会重复下载。
+#   - 抓不到（网络失败 / 脚本没写 desc）时菜单退回显示裸文件名，不影响运行。
 #   - `tmd run <名>`、编号选择仍以真实文件名为准。
 
 REPO_OWNER="laosan-xx"
@@ -36,6 +40,8 @@ SELF_SHA="${SELF}.sha"
 CACHE_DIR="/tmp/tmd.d"
 INDEX="${CACHE_DIR}/index"
 SCRIPTS="${CACHE_DIR}/scripts"
+DESC_TMP="${CACHE_DIR}/desc"   # 本次刷新抓到的自描述暂存目录
+TAB=$(printf '\t')             # 索引是 name<TAB>sha<TAB>desc 三列
 CACHE_TTL=600   # 列表缓存有效期（秒），默认 10 分钟
 
 # 选择可用的下载器
@@ -71,18 +77,82 @@ parse_index() {
     done
 }
 
+# 读取单个脚本的自描述：约定在脚本头部 4KB 内写一行
+#   # desc: 中文说明
+# 抓不到就留空，由 desc_of() 的内置表兜底
+fetch_desc() {
+    mkdir -p "$DESC_TMP"
+    raw="${DESC_TMP}/.raw.$1"
+    $FETCH "${RAW_BASE}/$1" 2>/dev/null | head -c 4096 2>/dev/null > "$raw"
+    if [ ! -s "$raw" ]; then
+        rm -f "$raw"
+        return 1 # 下载失败：不落结果，留待下次刷新重试
+    fi
+    sed -n 's/^#[[:space:]]*desc:[[:space:]]*//p' "$raw" | head -n1 > "${DESC_TMP}/$1"
+    rm -f "$raw"
+}
+
 # 拉取并刷新脚本列表缓存；成功返回 0
+# 索引格式：#ts <时间戳> + 每行 name<TAB>sha<TAB>desc
 fetch_index() {
-    local json
+    local json name sha desc todo i cnt
     json=$($FETCH "$API_URL" 2>/dev/null)
     if [ -z "$json" ]; then
         return 1
     fi
     mkdir -p "$CACHE_DIR" "$SCRIPTS"
+    echo "$json" | parse_index > "${CACHE_DIR}/index.new" || return 1
+
+    # 脚本 sha 没变就沿用旧缓存里的中文名，日常刷新不会再逐个下载
+    # （即使旧描述是空的也沿用：说明已抓过、脚本本身没写 desc，不必重抓）
+    [ -f "$INDEX" ] || echo "#ts 0" > "$INDEX"
+    # 旧版本缓存只有两列（没有 desc），这种条目当作"未抓过"重抓一次
+    awk -F'\t' '
+        NR == FNR {
+            if ($1 ~ /^#/ || NF < 2) next
+            s[$1] = $2
+            d[$1] = (NF >= 3 ? $3 : "__FETCH__")
+            next
+        }
+        { printf "%s\t%s\t%s\n", $1, $2, (s[$1] == $2 ? d[$1] : "__FETCH__") }
+    ' "$INDEX" "${CACHE_DIR}/index.new" > "${CACHE_DIR}/index.merged"
+
+    # 只抓新出现 / 内容有变化 / 上次没抓成功的脚本
+    todo=$(awk -F'\t' '$3 == "__FETCH__" || $3 == "__RETRY__" { print $1 }' "${CACHE_DIR}/index.merged")
+    if [ -n "$todo" ]; then
+        rm -rf "$DESC_TMP"
+        mkdir -p "$DESC_TMP"
+        cnt=$(echo $todo | wc -w | tr -d ' ')
+        echo "正在读取脚本自描述（${cnt} 个，仅首次或有更新时才联网）..."
+        i=0
+        for name in $todo; do
+            fetch_desc "$name" &
+            i=$((i + 1))
+            [ $((i % 4)) -eq 0 ] && wait
+        done
+        wait
+    fi
+
     {
         echo "#ts $(date +%s)"
-        echo "$json" | parse_index
+        while IFS="$TAB" read -r name sha desc; do
+            [ -z "$name" ] && continue
+            if [ "$desc" = "__FETCH__" ] || [ "$desc" = "__RETRY__" ]; then
+                if [ -f "${DESC_TMP}/$name" ]; then
+                    desc=$(cat "${DESC_TMP}/$name" 2>/dev/null)
+                else
+                    desc="__RETRY__" # 没抓成功，留着下次重试
+                fi
+            fi
+            if [ -n "$desc" ]; then
+                printf '%s\t%s\t%s\n' "$name" "$sha" "$desc"
+            else
+                printf '%s\t%s\t\n' "$name" "$sha"
+            fi
+        done < "${CACHE_DIR}/index.merged"
     } > "${INDEX}.tmp" && mv -f "${INDEX}.tmp" "$INDEX" || return 1
+
+    rm -f "${CACHE_DIR}/index.new" "${CACHE_DIR}/index.merged"
     # 列表已更新，脚本缓存失效，清除以便按需重新下载
     rm -rf "$SCRIPTS"; mkdir -p "$SCRIPTS"
     return 0
@@ -104,20 +174,14 @@ load_names() {
 }
 
 # 脚本的中文名（菜单里显示中文，括号内保留真实文件名，`tmd run` 仍用文件名）
-# 新增脚本时在这里补一行；没登记的仍显示文件名
+# 唯一来源是脚本头部的 "# desc:"（刷新列表时抓进索引），抓不到就返回空
 desc_of() {
-    case "$1" in
-    cf.sh)              printf 'Cloudflare 优选 IP 测速\n' ;;
-    find-cdn-ips.sh)    printf '扫描 CDN 可用 IP 段\n' ;;
-    frpc_update.sh)     printf 'frpc 手动升级\n' ;;
-    ip-change.sh)       printf '公网 IP 变动 Telegram 通知\n' ;;
-    ip_rotate_check.sh) printf 'IP 质量体检 / 不合格自动换 IP\n' ;;
-    nz.sh)              printf '哪吒监控探针安装\n' ;;
-    os-update.sh)       printf 'OpenWrt 在线系统更新\n' ;;
-    proxy-manager.sh)   printf 'OpenClash 安装 / 管理\n' ;;
-    wan_monitor.sh)     printf 'WAN 口断线监测\n' ;;
-    *)                  printf '\n' ;;
+    local d
+    d=$(awk -F'\t' -v n="$1" '$1 == n { print $3; exit }' "$INDEX" 2>/dev/null)
+    case "$d" in
+    __FETCH__ | __RETRY__) d="" ;; # 内部占位符，视为没抓到
     esac
+    printf '%s\n' "$d"
 }
 
 # 运行指定脚本：优先用本地缓存，缺失才下载

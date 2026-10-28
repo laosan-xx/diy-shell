@@ -1,4 +1,5 @@
 #!/bin/sh
+# desc: OpenWrt 在线系统更新
 # os-update.sh —— OpenWrt 在线系统更新脚本 (修复版)
 # 修复: awk 解析 GitHub API JSON 时 size 字段错位导致 sysupgrade 被误杀
 #

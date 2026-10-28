@@ -1,4 +1,5 @@
 #!/bin/sh
+# desc: 公网 IP 变动 Telegram 通知
 
 # 配置信息
 TOKEN="7622740934:AAETTKoZ_E0EYxUbINpEdzMi__i09uqyqsA"

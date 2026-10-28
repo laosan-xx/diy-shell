@@ -1,4 +1,5 @@
 #!/bin/sh
+# desc: 扫描 CDN 可用 IP 段
 
 # 配置变量
 START_IP=1

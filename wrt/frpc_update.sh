@@ -1,4 +1,5 @@
 #!/bin/sh
+# desc: frpc 手动升级到最新版
 # update_frpc_openwrt.sh
 #
 # 在 OpenWRT 上手动把 frpc 升级到 laosan-xx/frp 指定/最新版本。

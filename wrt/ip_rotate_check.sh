@@ -1,4 +1,5 @@
 #!/bin/sh
+# desc: IP 质量体检 / 不合格自动换 IP
 #
 # VPS 换 IP 后的自动体检：换 IP -> 查分 + 代理标记 -> 不合格继续换
 # （ip_rotate_check.py 的 shell 版，纯 POSIX sh + busybox，无需 python / jq）

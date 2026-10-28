@@ -1,4 +1,5 @@
 #!/bin/sh
+# desc: OpenWRT 科学管理
 set -eu
 
 REPO="slobys/openclash-auto-installer"

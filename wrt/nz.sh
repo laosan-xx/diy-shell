@@ -1,4 +1,5 @@
 #!/bin/sh
+# desc: 哪吒监控探针安装
 
 # --- 哪吒监控 (Nezha) 探针 OpenWRT 安装脚本 ---
 #

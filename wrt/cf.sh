@@ -1,4 +1,5 @@
 #!/bin/sh
+# desc: Cloudflare CDN IP 优选测速
 
 # --- Cloudflare CDN IP 优选脚本 ---
 # 依赖: cdnspeedtest 二进制 (CONFIG_PACKAGE_cdnspeedtest)
