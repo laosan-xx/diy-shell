@@ -322,28 +322,70 @@ HPEOF
 }
 
 # ============================================================
-# 4. 重启服务（后台执行，避免 SSH 断开中断脚本）
+# 4. 应用配置（ubus reload 热加载，不重启网络，LAN 保持在线）
 # ============================================================
 apply_services() {
     cat >/tmp/ipv6-apply.sh <<'APPLY'
 #!/bin/sh
-/etc/init.d/network restart >/dev/null 2>&1
+# 不要用 /etc/init.d/network restart：
+# 它会把 br-lan 整个 down 掉再重建，个别固件（本项目遇到的就是）
+# netifd 在重建阶段会卡死 —— LAN 保持 down、SSH 进不来、只能硬断电。
+# 这里改用 ubus reload 增量应用配置，LAN 链路全程保持 up。
+if ubus call network reload >/dev/null 2>&1; then
+	sleep 3
+	ubus call network reload >/dev/null 2>&1 # 二次触发，确保变更真正落地
+	sleep 3
+else
+	logger -t ipv6-fix "ubus reload 不可用，退回 network restart"
+	/etc/init.d/network restart >/dev/null 2>&1
+	sleep 3
+fi
+
+# 只重新拉起 wan6 / lan 这两个接口，不动 br-lan 的物理链路
+ifup wan6 >/dev/null 2>&1
 sleep 2
+ifup lan >/dev/null 2>&1
+sleep 2
+
 [ -x /etc/init.d/odhcpd ] && /etc/init.d/odhcpd restart >/dev/null 2>&1
 [ -x /etc/init.d/firewall ] && /etc/init.d/firewall restart >/dev/null 2>&1
+sleep 2
+
+# 自愈：万一 lan 没正常起来，自己拉一次，别让人跑去断电
+if ! ip -4 addr show dev br-lan 2>/dev/null | grep -q 'inet '; then
+	logger -t ipv6-fix "br-lan 没有 IPv4，尝试 ifup lan 自愈"
+	ifup lan >/dev/null 2>&1
+	sleep 3
+fi
+if ! ip -4 addr show dev br-lan 2>/dev/null | grep -q 'inet '; then
+	logger -t ipv6-fix "br-lan 仍无 IPv4，重启 dnsmasq 兜底"
+	/etc/init.d/dnsmasq restart >/dev/null 2>&1
+fi
+
 touch /tmp/ipv6-apply.done
 APPLY
     chmod +x /tmp/ipv6-apply.sh
     rm -f /tmp/ipv6-apply.done
-    nohup /tmp/ipv6-apply.sh >/tmp/ipv6-apply.log 2>&1 &
-    echo "服务正在后台重启（SSH 可能短暂断开），等它跑完再验证..."
+    # setsid：SSH 断开时不让会话把应用进程一起带走
+    if command -v setsid >/dev/null 2>&1; then
+        setsid /tmp/ipv6-apply.sh >/tmp/ipv6-apply.log 2>&1 &
+    else
+        nohup /tmp/ipv6-apply.sh >/tmp/ipv6-apply.log 2>&1 &
+    fi
+    echo "配置正在热加载（走 ubus reload，不重启网络，LAN 不会断开）..."
     i=0
     while [ $i -lt 60 ]; do
         [ -f /tmp/ipv6-apply.done ] && break
         sleep 1
         i=$((i + 1))
     done
-    [ -f /tmp/ipv6-apply.done ] || warn "等待超时，服务可能还在重启；稍后执行 status 复查"
+    if [ ! -f /tmp/ipv6-apply.done ]; then
+        warn "等待超时，服务可能还在应用"
+        echo "  若 SSH 已经断开、迟迟连不上，按顺序试："
+        echo "    1) 等 60 秒：netifd 有时会自己把 br-lan 拉回来"
+        echo "    2) 连 WiFi 试试（无线不一定跟着断），或给电脑设静态 IP 192.168.99.2"
+        echo "    3) 都不行就断电重启 —— 配置在 6/6 之前已经 commit，不会丢"
+    fi
 }
 
 # ============================================================
@@ -355,7 +397,7 @@ verify() {
     if [ -n "$UN" ]; then
         ok "默认路由：$UN"
     else
-        err "没有不限源的默认路由 —— hotplug 可能没触发，执行 /etc/init.d/network restart 后再看"
+        err "没有不限源的默认路由 —— hotplug 可能没触发，执行 ifup wan6 后再看"
     fi
 
     LD=$(lan_dev)
@@ -397,7 +439,7 @@ fix() {
     echo
     echo "==================== 一键开启 NAT66 ===================="
     echo "将修改 network / dhcp / firewall，并安装默认路由 hotplug；"
-    echo "随后重启网络服务，SSH 会短暂断开。配置会先备份，可随时 rollback。"
+    echo "随后热加载配置（不重启网络，LAN 不会断）。配置会先备份，可随时 rollback。"
     echo
     do_backup
 
@@ -479,7 +521,7 @@ fix() {
     fi
 
     # ---------- 6. hotplug + 应用 ----------
-    say "6/6 安装默认路由 hotplug 并重启服务"
+    say "6/6 安装默认路由 hotplug 并热加载配置"
     install_hotplug
     ok "已安装 $HOTPLUG"
     echo "$(date +%s)" >/root/.ipv6_nat66_enabled
@@ -528,7 +570,7 @@ rollback() {
 
     apply_services
     echo
-    ok "已回滚，网络服务已重启"
+    ok "已回滚，配置已重新加载"
     echo "（原始备份记录保留在 $ORIGIN_BK，如需彻底清除：rm -f $ORIGIN_BK $LAST_BK）"
 }
 
@@ -587,7 +629,7 @@ EOF
 
 confirm_fix() {
     echo
-    echo "将修改 network / dhcp / firewall 并重启网络服务，SSH 会短暂断开。"
+    echo "将修改 network / dhcp / firewall 并热加载配置（不重启网络，LAN 不会断）。"
     echo "配置会先备份，可随时用 rollback 还原。"
     printf "继续？[y/N]: "
     read -r a
