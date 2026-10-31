@@ -187,19 +187,47 @@ desc_of() {
     printf '%s\n' "$d"
 }
 
+# 校验下载结果是否可以安全执行
+# uclient-fetch 超时、代理断流、代理返回错误页，都会留下一个非空但残缺的文件。
+# 只看 -s 会把半截脚本当成完整脚本缓存起来并执行，报
+#   syntax error: unterminated quoted string
+# 更麻烦的是坏文件留在缓存里不会失效，重跑多少次都是同一个错。
+valid_script() {
+    [ -s "$1" ] || return 1
+    head -n1 "$1" 2>/dev/null | grep -q '^#!' || return 1
+    # 被截断的文件最后一行没有换行符
+    [ -z "$(tail -c 1 "$1" 2>/dev/null)" ] || return 1
+    # 语法预检：截断的脚本在这一步必挂（busybox ash 支持 -n）
+    sh -n "$1" 2>/dev/null || return 1
+    return 0
+}
+
 # 运行指定脚本：优先用本地缓存，缺失才下载
 run_named() {
     local name="$1"
     local cached="$SCRIPTS/$name"
+    local tmp="${cached}.part"
+    # 缓存里已有的坏文件（历史上被截断过）直接丢掉，否则永远报语法错误
+    if [ -s "$cached" ] && ! valid_script "$cached"; then
+        echo "缓存中的脚本不完整，已丢弃: $name" >&2
+        rm -f "$cached"
+    fi
     if [ ! -s "$cached" ]; then
         echo "正在下载脚本: $name"
         mkdir -p "$SCRIPTS"
-        $FETCH "${RAW_BASE}/${name}" > "$cached" 2>/dev/null
-    fi
-    if [ ! -s "$cached" ]; then
-        echo "错误：脚本不可用（网络问题或文件不存在）: $name" >&2
-        rm -f "$cached"
-        return 1
+        rm -f "$tmp"
+        # 先写临时文件、校验通过才落盘：下载失败时缓存保持为空，下次会重下
+        if ! $FETCH "${RAW_BASE}/${name}" > "$tmp" 2>/dev/null; then
+            rm -f "$tmp"
+            echo "错误：脚本下载失败（网络中断或代理异常）: $name" >&2
+            return 1
+        fi
+        if ! valid_script "$tmp"; then
+            rm -f "$tmp"
+            echo "错误：下载内容不完整或不是脚本，已丢弃: $name" >&2
+            return 1
+        fi
+        mv -f "$tmp" "$cached"
     fi
     echo "----------------------------------------"
     echo "运行: $name"
@@ -236,8 +264,9 @@ do_check() {
 do_update() {
     echo "正在下载最新 TMD 本体 ..."
     TMP_SELF="/tmp/tmd_self.$$"
-    if ! $FETCH "$SELF_REMOTE" > "$TMP_SELF" 2>/dev/null || [ ! -s "$TMP_SELF" ]; then
-        echo "错误：下载 TMD 本体失败: $SELF_REMOTE" >&2
+    # 同样要校验完整性：半截的本体会把 tmd 自己搞坏，比脚本损坏更麻烦
+    if ! $FETCH "$SELF_REMOTE" > "$TMP_SELF" 2>/dev/null || ! valid_script "$TMP_SELF"; then
+        echo "错误：下载 TMD 本体失败或内容不完整: $SELF_REMOTE" >&2
         rm -f "$TMP_SELF"
         return 1
     fi
