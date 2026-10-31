@@ -41,6 +41,16 @@ need_root() {
 
 J() { ifstatus "$1" 2>/dev/null | jsonfilter -e "$2" 2>/dev/null; }
 
+# odhcpd 是否真的接管了 LAN。
+# 接管成功才会在 DHCPv6 服务端口 547 上监听；没接管时它既不发 RA 也不回 DHCPv6，
+# 客户端就只有 fe80、拿不到地址 —— 而且它不会自己恢复，只能重启。
+# 触发条件：odhcpd 在 br-lan 还没拿到 ULA 前缀时启动（netifd 应用 ula_prefix 稍晚）。
+odhcpd_serving() {
+    netstat -lnup 2>/dev/null | grep -q ':547' && return 0
+    # 精简固件没有 netstat 时直接查 /proc/net/udp6（0223 = 547）
+    awk 'NR > 1 { n = split($2, a, ":"); if (n > 1 && a[2] == "0223") f = 1 } END { exit(f ? 0 : 1) }' /proc/net/udp6 2>/dev/null
+}
+
 lan_dev() {
     d=$(uci -q get network.lan.device)
     [ -z "$d" ] && d=$(uci -q get network.lan.ifname)
@@ -206,8 +216,14 @@ $1"; }
 
     say "11. odhcpd"
     if pgrep -f odhcpd >/dev/null 2>&1; then
-        echo "运行中"
-        finding "[ OK ] odhcpd 运行中"
+        if odhcpd_serving; then
+            echo "运行中，已在 547 端口接管 LAN"
+            finding "[ OK ] odhcpd 正常服务"
+        else
+            echo "进程在跑，但没有监听 547（没接管 LAN）"
+            finding "[ XX ] odhcpd 空转：不监听 547、不发 RA -> 客户端只有 fe80，拿不到 IPv6 地址"
+            advise "odhcpd 在 br-lan 还没有 ULA 地址时启动会丢掉 lan 段且不自愈，重启即可：/etc/init.d/odhcpd restart"
+        fi
     else
         echo "未运行"
         finding "[ XX ] odhcpd 没运行 -> LAN 不发 RA/DHCPv6"
@@ -347,7 +363,44 @@ sleep 2
 ifup lan >/dev/null 2>&1
 sleep 2
 
-[ -x /etc/init.d/odhcpd ] && /etc/init.d/odhcpd restart >/dev/null 2>&1
+# 关键顺序：必须等 br-lan 真正拿到 ULA 之后再重启 odhcpd。
+# odhcpd 若在 br-lan 还没有前缀时启动，会直接丢掉 lan 段：
+#   不监听 547（DHCPv6）、不发 RA，而且不会自愈。
+# 现象就是客户端只有一个 fe80，跑完 fix 依然"不通 IPv6"，只能手动重启 odhcpd。
+LANDEV=$(uci -q get network.lan.device)
+[ -z "$LANDEV" ] && LANDEV=$(uci -q get network.lan.ifname)
+[ -z "$LANDEV" ] && LANDEV=br-lan
+
+i=0
+while [ $i -lt 20 ]; do
+	ip -6 addr show dev "$LANDEV" 2>/dev/null | grep -q 'inet6 fd' && break
+	sleep 1
+	i=$((i + 1))
+done
+
+odhcpd_serving() {
+	netstat -lnup 2>/dev/null | grep -q ':547' && return 0
+	awk 'NR > 1 { n = split($2, a, ":"); if (n > 1 && a[2] == "0223") f = 1 } END { exit(f ? 0 : 1) }' /proc/net/udp6 2>/dev/null
+}
+
+restart_odhcpd() {
+	[ -x /etc/init.d/odhcpd ] || return 1
+	/etc/init.d/odhcpd restart >/dev/null 2>&1
+	k=0
+	while [ $k -lt 6 ]; do
+		odhcpd_serving && return 0
+		sleep 2
+		k=$((k + 1))
+	done
+	return 1
+}
+
+if ! restart_odhcpd; then
+	logger -t ipv6-fix "odhcpd 未监听 547，8 秒后重试（前缀可能还没就绪）"
+	sleep 8
+	restart_odhcpd || logger -t ipv6-fix "odhcpd 仍未接管 LAN，客户端可能拿不到 IPv6"
+fi
+
 [ -x /etc/init.d/firewall ] && /etc/init.d/firewall restart >/dev/null 2>&1
 sleep 2
 
@@ -374,7 +427,7 @@ APPLY
     fi
     echo "配置正在热加载（走 ubus reload，不重启网络，LAN 不会断开）..."
     i=0
-    while [ $i -lt 60 ]; do
+    while [ $i -lt 90 ]; do
         [ -f /tmp/ipv6-apply.done ] && break
         sleep 1
         i=$((i + 1))
@@ -416,6 +469,12 @@ verify() {
         ok "防火墙规则已加载（${N} 行）"
     else
         err "防火墙规则异常（${N:-0} 行）—— 跑 fw4 check 看原因"
+    fi
+
+    if odhcpd_serving; then
+        ok "odhcpd 已接管 LAN（547 端口在听，RA/DHCPv6 在发）"
+    else
+        err "odhcpd 没有接管 LAN（547 未监听）—— 客户端拿不到地址，执行 /etc/init.d/odhcpd restart"
     fi
 
     [ -x "$HOTPLUG" ] && ok "默认路由 hotplug 已安装" || err "hotplug 未安装"
@@ -594,9 +653,10 @@ status() {
     echo "  hotplug       : $([ -x "$HOTPLUG" ] && echo 已安装 || echo 未安装)"
     echo "  nft 规则行数  : ${N:-0}"
     echo "  odhcpd        : $(pgrep -f odhcpd >/dev/null 2>&1 && echo 运行中 || echo 未运行)"
+    echo "  odhcpd 接管LAN: $(odhcpd_serving && echo 是 || echo 否-需重启odhcpd)"
     echo
 
-    if [ "$M" = "1" ] && [ -n "$UN" ] && [ -x "$HOTPLUG" ]; then
+    if [ "$M" = "1" ] && [ -n "$UN" ] && [ -x "$HOTPLUG" ] && odhcpd_serving; then
         ok "NAT66 配置完整"
     else
         warn "NAT66 配置不完整，建议先 diag 查原因"
