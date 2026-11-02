@@ -83,12 +83,15 @@ parse_index() {
 fetch_desc() {
     mkdir -p "$DESC_TMP"
     raw="${DESC_TMP}/.raw.$1"
-    $FETCH "${RAW_BASE}/$1" 2>/dev/null | head -c 4096 2>/dev/null > "$raw"
+    # 只取前 30 行（头部注释区），不用 head -c：部分 busybox 没编 FANCY_HEAD，
+    # head -c 会直接报错，导致抓到的永远是空文件
+    $FETCH "${RAW_BASE}/$1" 2>/dev/null | sed -n '1,30p' > "$raw"
     if [ ! -s "$raw" ]; then
         rm -f "$raw"
         return 1 # 下载失败：不落结果，留待下次刷新重试
     fi
-    sed -n 's/^#[[:space:]]*desc:[[:space:]]*//p' "$raw" | head -n1 > "${DESC_TMP}/$1"
+    # 只用最基础的空格匹配，不依赖 [[:space:]] / \t 转义；顺手去掉 CRLF 的 \r
+    sed -n 's/^# *desc: *//p' "$raw" | head -n1 | tr -d '\r' > "${DESC_TMP}/$1"
     rm -f "$raw"
 }
 
@@ -107,7 +110,9 @@ fetch_index() {
     # （即使旧描述是空的也沿用：说明已抓过、脚本本身没写 desc，不必重抓）
     [ -f "$INDEX" ] || echo "#ts 0" > "$INDEX"
     # 旧版本缓存只有两列（没有 desc），这种条目当作"未抓过"重抓一次
-    awk -F'\t' '
+    # 用真实 TAB 字符当分隔符，别写 -F'\t'：部分 busybox awk 不解析这个转义，
+    # 会把整行当成一个字段，$3 永远为空 -> 菜单就退化成裸文件名
+    awk -F "$TAB" '
         NR == FNR {
             if ($1 ~ /^#/ || NF < 2) next
             s[$1] = $2
@@ -118,7 +123,7 @@ fetch_index() {
     ' "$INDEX" "${CACHE_DIR}/index.new" > "${CACHE_DIR}/index.merged"
 
     # 只抓新出现 / 内容有变化 / 上次没抓成功的脚本
-    todo=$(awk -F'\t' '$3 == "__FETCH__" || $3 == "__RETRY__" { print $1 }' "${CACHE_DIR}/index.merged")
+    todo=$(awk -F "$TAB" '$3 == "__FETCH__" || $3 == "__RETRY__" { print $1 }' "${CACHE_DIR}/index.merged")
     if [ -n "$todo" ]; then
         rm -rf "$DESC_TMP"
         mkdir -p "$DESC_TMP"
@@ -135,7 +140,7 @@ fetch_index() {
 
     {
         echo "#ts $(date +%s)"
-        echo "#v2" # 索引版本：带 #v2 才表示 desc 列已抓取过，旧缓存据此判废
+        echo "#v3" # 索引版本：带 #v3 才表示 desc 列已按当前逻辑抓取过，旧缓存据此判废
         while IFS="$TAB" read -r name sha desc; do
             [ -z "$name" ] && continue
             if [ "$desc" = "__FETCH__" ] || [ "$desc" = "__RETRY__" ]; then
@@ -164,7 +169,7 @@ cache_valid() {
     [ -f "$INDEX" ] || return 1
     local now ts
     # 旧格式索引（没有中文名列）判废，否则升级后菜单会一直是裸文件名
-    grep -qx '#v2' "$INDEX" 2>/dev/null || return 1
+    grep -qx '#v3' "$INDEX" 2>/dev/null || return 1
     now=$(date +%s)
     ts=$(sed -n 's/^#ts //p' "$INDEX" | head -n1)
     [ -n "$ts" ] || return 1
@@ -172,15 +177,16 @@ cache_valid() {
 }
 
 # 从缓存读取脚本名列表（每行一个，跳过 # 头）
+# 用 cut -f1 而不是 sed 's/\t.*//'：cut 默认分隔符就是 TAB，不依赖 \t 转义
 load_names() {
-    sed -e '/^#/d' -e 's/\t.*//' "$INDEX"
+    sed '/^#/d' "$INDEX" | cut -f1
 }
 
 # 脚本的中文名（菜单里显示中文，括号内保留真实文件名，`tmd run` 仍用文件名）
 # 唯一来源是脚本头部的 "# desc:"（刷新列表时抓进索引），抓不到就返回空
 desc_of() {
     local d
-    d=$(awk -F'\t' -v n="$1" '$1 == n { print $3; exit }' "$INDEX" 2>/dev/null)
+    d=$(awk -F "$TAB" -v n="$1" '$1 == n { print $3; exit }' "$INDEX" 2>/dev/null)
     case "$d" in
     __FETCH__ | __RETRY__) d="" ;; # 内部占位符，视为没抓到
     esac
