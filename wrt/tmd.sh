@@ -67,9 +67,17 @@ get_file_sha() {
 
 # ---------- 本地缓存：列表 + 脚本 ----------
 # 解析目录 Contents API 的 JSON，逐行输出 "name<TAB>sha"（排除 tmd.sh）
+# GitHub 返回的是带缩进的多行 JSON，name 和 sha 在相邻两行：
+#   "name": "cf.sh",
+#   "path": "wrt/cf.sh",
+#   "sha": "19074a96...",
+# 逐行 grep -o 只能拿到 name、sha 恒为空；sha 空会让"内容是否变化"永远判等，
+# 于是描述永远复用旧的（空）值、从不抓取。必须先压成单行再匹配。
 parse_index() {
-    grep -o '"name": *"[^"]*\.sh"[^}]*' \
-    | while IFS= read -r obj; do
+    tr -d '\n\r' \
+        | tr -s ' ' \
+        | grep -o '"name": *"[^"]*\.sh"[^}]*' \
+        | while IFS= read -r obj; do
         name=$(echo "$obj" | sed -n 's/.*"name": *"\([^"]*\)".*/\1/p')
         sha=$(echo "$obj" | sed -n 's/.*"sha": *"\([^"]*\)".*/\1/p')
         [ "$name" = "tmd.sh" ] && continue
