@@ -418,7 +418,8 @@ cron_line() {
     # 距上次运行不到 N 天就跳过。减 1 分钟是给踩点抖动留余量，
     # 否则第 N 天同一时刻可能因为差几秒被判成"N-1 天"而拖到 N+1 天。
     _stamp=$(cron_stamp_path)
-    printf '%s %s * * * if [ ! -f %s ] || [ -n "$(find %s -mmin +%s 2>/dev/null)" ]; then touch %s; %ssh %s --conf %s >> %s 2>&1; fi\n' \
+    # 标记文件同时写一行时间：判断间隔靠 mtime，内容只是给人看"上次几点跑的"
+    printf '%s %s * * * if [ ! -f %s ] || [ -n "$(find %s -mmin +%s 2>/dev/null)" ]; then date > %s; %ssh %s --conf %s >> %s 2>&1; fi\n' \
         "$_lm" "$_lh" "$_stamp" "$_stamp" "$((_days * 1440 - 100))" \
         "$_stamp" "$_pre" "$_bin" "$CONF_FILE" "$_log"
 }
@@ -469,7 +470,8 @@ cron_install() {
 
 cron_remove() {
     if ! have crontab; then
-        echo "系统里没有 crontab" >&2
+        echo "系统里没有 crontab 命令，手动删除：" >&2
+        echo "  sed -i '/ip_rotate_check/d' /etc/crontabs/root && /etc/init.d/cron restart" >&2
         return 1
     fi
     _all=$(crontab -l 2>/dev/null)
@@ -481,13 +483,14 @@ cron_remove() {
         else
             printf '' | crontab -
         fi
-        rm -f "$(cron_stamp_path)" 2>/dev/null
         echo "已从 crontab 移除 ip_rotate_check 的定时任务。"
         ;;
     *)
         echo "crontab 里没有 ip_rotate_check 的条目，无需移除。"
         ;;
     esac
+    # 标记文件无论有没有条目都清掉，免得下次安装沿用旧的"上次运行时间"
+    rm -f "$(cron_stamp_path)" 2>/dev/null
     return 0
 }
 

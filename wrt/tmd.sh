@@ -56,10 +56,20 @@ else
     exit 1
 fi
 
+# 代理和 GitHub 都会给 raw / API 回 5~60 秒缓存，刚 push 完就抓很容易拿到上一版。
+# 给 URL 加个时间戳，保证每次都是唯一的 cache key。
+bust_url() {
+    case "$1" in
+    *\?*) printf '%s&t=%s\n' "$1" "$(date +%s)" ;;
+    *) printf '%s?t=%s\n' "$1" "$(date +%s)" ;;
+    esac
+}
+
 # 从单文件 Contents API 直接拿到某文件的 sha（通用）
 # $1 = 文件名；请求 .../contents/wrt/<文件名>?ref=<分支>
 get_file_sha() {
-    local url="${FILE_API_URL}/$1?ref=${REPO_BRANCH}"
+    local url
+    url=$(bust_url "${FILE_API_URL}/$1?ref=${REPO_BRANCH}")
     $FETCH "$url" 2>/dev/null \
         | grep -o '"sha": *"[^"]*"' \
         | head -n1 | sed 's/"sha": *"//; s/"$//'
@@ -93,7 +103,7 @@ fetch_desc() {
     raw="${DESC_TMP}/.raw.$1"
     # 只取前 30 行（头部注释区），不用 head -c：部分 busybox 没编 FANCY_HEAD，
     # head -c 会直接报错，导致抓到的永远是空文件
-    $FETCH "${RAW_BASE}/$1" 2>/dev/null | sed -n '1,30p' > "$raw"
+    $FETCH "$(bust_url "${RAW_BASE}/$1")" 2>/dev/null | sed -n '1,30p' > "$raw"
     if [ ! -s "$raw" ]; then
         rm -f "$raw"
         return 1 # 下载失败：不落结果，留待下次刷新重试
@@ -107,7 +117,7 @@ fetch_desc() {
 # 索引格式：#ts <时间戳> + 每行 name<TAB>sha<TAB>desc
 fetch_index() {
     local json name sha desc todo i cnt
-    json=$($FETCH "$API_URL" 2>/dev/null)
+    json=$($FETCH "$(bust_url "$API_URL")" 2>/dev/null)
     if [ -z "$json" ]; then
         return 1
     fi
@@ -231,7 +241,7 @@ run_named() {
         mkdir -p "$SCRIPTS"
         rm -f "$tmp"
         # 先写临时文件、校验通过才落盘：下载失败时缓存保持为空，下次会重下
-        if ! $FETCH "${RAW_BASE}/${name}" > "$tmp" 2>/dev/null; then
+        if ! $FETCH "$(bust_url "${RAW_BASE}/${name}")" > "$tmp" 2>/dev/null; then
             rm -f "$tmp"
             echo "错误：脚本下载失败（网络中断或代理异常）: $name" >&2
             return 1
@@ -244,7 +254,7 @@ run_named() {
         mv -f "$tmp" "$cached"
     fi
     echo "----------------------------------------"
-    echo "运行: $name"
+    echo "运行: $name（$(wc -c <"$cached" | tr -d ' ') 字节）"
     echo "----------------------------------------"
     sh "$cached"
 }
@@ -279,7 +289,7 @@ do_update() {
     echo "正在下载最新 TMD 本体 ..."
     TMP_SELF="/tmp/tmd_self.$$"
     # 同样要校验完整性：半截的本体会把 tmd 自己搞坏，比脚本损坏更麻烦
-    if ! $FETCH "$SELF_REMOTE" > "$TMP_SELF" 2>/dev/null || ! valid_script "$TMP_SELF"; then
+    if ! $FETCH "$(bust_url "$SELF_REMOTE")" > "$TMP_SELF" 2>/dev/null || ! valid_script "$TMP_SELF"; then
         echo "错误：下载 TMD 本体失败或内容不完整: $SELF_REMOTE" >&2
         rm -f "$TMP_SELF"
         return 1
@@ -373,8 +383,25 @@ case "$1" in
     update)   do_update;   exit $? ;;
     sethost)  do_sethost;  exit $? ;;
     restore)  do_restorehost; exit $? ;;
-    refresh)  fetch_index && echo "脚本列表已刷新。" || { echo "刷新失败（网络问题）。" >&2; exit 1; } ;;
-    run)      shift; if [ -z "${1:-}" ]; then echo "用法: tmd run <脚本名>" >&2; exit 1; fi; run_named "$1"; exit $? ;;
+    refresh)
+        if fetch_index; then
+            echo "脚本列表已刷新（$(load_names | wc -l | tr -d ' ') 个脚本），脚本缓存已清空，下次运行会重新下载。"
+            exit 0
+        fi
+        echo "刷新失败（网络问题），仍在使用旧缓存。" >&2
+        exit 1
+        ;;
+    run)
+        shift
+        if [ -z "${1:-}" ]; then
+            echo "用法: tmd run <脚本名>" >&2
+            exit 1
+        fi
+        # 索引过期就先刷一次，否则 tmd run 可能一直用很久以前的缓存
+        cache_valid || fetch_index >/dev/null 2>&1
+        run_named "$1"
+        exit $?
+        ;;
 esac
 
 mkdir -p "$CACHE_DIR" "$SCRIPTS"
