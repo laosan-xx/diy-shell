@@ -41,6 +41,8 @@
 #   sh ip_rotate_check.sh --rotate-url "..." --save-conf
 #   # 装进 crontab：每天北京时间 04:30 跑（改时间用 --cron-time 07:00）
 #   sh ip_rotate_check.sh --rotate-url "..." --cron-install
+#   # 每 3 天跑一次（不加 --cron-days 就是每天；装的时候也会问你几天一次）
+#   sh ip_rotate_check.sh --rotate-url "..." --cron-install --cron-days 3
 #   sh ip_rotate_check.sh --cron-print      # 只看看会写成什么样
 #   sh ip_rotate_check.sh --cron-remove     # 卸载
 #   sh ip_rotate_check.sh --check-ip 1.1.1.1 --deep
@@ -51,7 +53,7 @@
 #   只要出口 IP 变了就认为换完 -> 体检新 IP -> 不合格继续换；
 #   --wait-change 秒内没变则视为本次没换成功，按当前出口继续判定。
 # 出口 IP 用 iplark /ipapi/public/ip，失败退 api.ipify.org。
-# 接口本身耗时算在 --rotate-timeout（默认 25s，返回慢就加大）。
+# 接口本身耗时算在 --rotate-timeout（默认 40s，返回慢就加大）。
 #
 
 UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
@@ -62,7 +64,7 @@ ROTATE_URL=""        # 换 IP 的 HTTP 接口
 ROTATE_METHOD="GET"  # GET / POST
 ROTATE_TOKEN=""      # 放进 Authorization 头（如 "Bearer xxx" 或裸 token）
 ROTATE_DATA=""       # POST body，如 "id=123&area=us"
-ROTATE_TIMEOUT=25
+ROTATE_TIMEOUT=40
 ATTEMPTS=5
 PASS_LINE=80
 HARD_LINE=70
@@ -72,6 +74,7 @@ NO_PROXYCHECK=0
 NO_DIRECT=0
 WAIT_CHANGE=60
 LOG_FILE=""
+LOG_MAX=1048576  # 日志上限（字节），超过只留尾部 1/4；0=不限
 DRY_RUN=0
 SAVE_CONF=0
 JINA_FRESH=0     # 1 = 请求 jina 时带 X-No-Cache，不吃它 5 分钟的页面缓存
@@ -79,6 +82,9 @@ CACHE_TTL=21600  # 本地缓存有效期（秒），0 = 永不过期
 REFRESH=0        # 1 = 忽略本地缓存，重新查
 CRON_MODE=""     # install / remove / print
 CRON_TIME=04:30  # 定时时间，按北京时间算
+CRON_DAYS=1      # 每 N 天跑一次，1=每天
+CRON_DAYS_SET=0  # 1 = 命令行显式给了 --cron-days（安装时不再追问）
+CRON_STAMP=""    # 间隔运行的标记文件，空=跟配置文件同目录的 .ip_rotate.stamp
 CRON_LOG=""      # cron 输出日志，空=自动挑 /var/log 或 /tmp
 CRON_BIN_DIR=""  # 脚本复制目录，空=/usr/local/bin
 CACHE_FILE="${IP_ROTATE_CACHE:-}"
@@ -122,7 +128,7 @@ VPS 换 IP 后的自动体检：换 IP -> 查分 + 代理标记 -> 不合格继�
   --rotate-token S   接口鉴权，放进 Authorization 头
   --rotate-data S    POST body，如 "id=123&area=us" 或 '{"id":123}'
                      （以 { 或 [ 开头按 JSON 发，自动补 Content-Type）
-  --rotate-timeout N 接口超时秒数，默认 25
+  --rotate-timeout N 接口超时秒数，默认 40
   -n, --attempts N   最多尝试次数，默认 5
   --pass-line N      及格线，默认 80
   --hard-line N      硬伤线，默认 70（低于它直接换）
@@ -132,6 +138,7 @@ VPS 换 IP 后的自动体检：换 IP -> 查分 + 代理标记 -> 不合格继�
   --no-direct        跳过 /ipscore 直连，直接走 jina 渲染
   --wait-change N    换 IP 后等新 IP 生效的最长秒数，默认 60
   --log FILE         每次体检结果 + 换 IP 事件追加成 jsonl
+  --log-max SIZE     日志轮转上限，默认 1M（超了只留尾部 1/4，0=不限）
   --cache FILE       缓存文件，默认 ~/.ip_rotate_cache.tsv
   --cache-ttl N      本地缓存有效期秒数，默认 21600（6h），0=永不过期
   --refresh          忽略本地缓存，同 IP 也重新查
@@ -140,6 +147,7 @@ VPS 换 IP 后的自动体检：换 IP -> 查分 + 代理标记 -> 不合格继�
   --no-conf          忽略配置文件
   --save-conf        把当前参数存进配置文件后退出
   --cron-install     装进 crontab（默认每天北京时间 04:30 跑一次）
+  --cron-days N      每 N 天跑一次，默认 1=每天（安装时没给会问你）
   --cron-time HH:MM  定时时间，按北京时间算，默认 04:30
   --cron-log FILE    cron 的输出日志，默认 /var/log/ip_rotate_cron.log
   --cron-bin-dir DIR 脚本复制到哪个目录，默认 /usr/local/bin
@@ -228,7 +236,7 @@ have_rotate() {
 # 调商家的换 IP 接口：GET 直接把参数写在 URL 里，POST 用 ROTATE_DATA
 # body 以 { 或 [ 开头时按 JSON 发（自动补 Content-Type），否则按表单发
 rotate_api() {
-    _to=${ROTATE_TIMEOUT:-25}
+    _to=${ROTATE_TIMEOUT:-40}
     _m=${ROTATE_METHOD:-GET}
     _json=0
     case "$ROTATE_DATA" in
@@ -345,6 +353,36 @@ bj_to_local_hm() {
     printf '%02d:%02d\n' $((_local / 60)) $((_local % 60))
 }
 
+# 每 N 天跑一次：1=每天；0/超范围/非数字一律按 1（每天）处理
+cron_days_norm() {
+    case "${CRON_DAYS:-1}" in
+    '' | *[!0-9]*) printf '1\n' ;;
+    *)
+        if [ "$CRON_DAYS" -ge 1 ] && [ "$CRON_DAYS" -le 365 ]; then
+            printf '%s\n' "$CRON_DAYS"
+        else
+            printf '1\n'
+        fi
+        ;;
+    esac
+}
+
+# 间隔运行的标记文件：默认跟配置文件放同一目录（卸载时一起删掉）
+cron_stamp_path() {
+    if [ -n "$CRON_STAMP" ]; then
+        printf '%s\n' "$CRON_STAMP"
+        return 0
+    fi
+    case "${CONF_FILE:-}" in
+    */*)
+        _sd=${CONF_FILE%/*}
+        [ -n "$_sd" ] || _sd=/
+        ;;
+    *) _sd=$(writable_home) ;;
+    esac
+    printf '%s/.ip_rotate.stamp\n' "$_sd"
+}
+
 # 生成要写进 crontab 的那一行
 cron_line() {
     _hm_local=$(bj_to_local_hm "${CRON_TIME:-04:30}")
@@ -363,8 +401,26 @@ cron_line() {
     # cron 字段去掉前导 0，最稳
     _lm=${_lm#0}
     _lh=${_lh#0}
-    printf '%s %s * * * sh %s --conf %s >> %s 2>&1\n' \
-        "$_lm" "$_lh" "$_bin" "$CONF_FILE" "$_log"
+    _days=$(cron_days_norm)
+    # cron 的输出是重定向进日志的，脚本还没启动文件就打开了，所以轮转得写在这一行里
+    _max=$(parse_size "$LOG_MAX")
+    _pre=""
+    if [ "$_max" -gt 0 ]; then
+        _pre=$(printf 'if [ -f %s ] && [ "$(wc -c < %s)" -gt %s ]; then tail -c %s %s > %s.tmp; mv %s.tmp %s; fi; ' \
+            "$_log" "$_log" "$_max" "$((_max / 4))" "$_log" "$_log" "$_log" "$_log")
+    fi
+    if [ "$_days" -le 1 ]; then
+        printf '%s %s * * * %ssh %s --conf %s >> %s 2>&1\n' \
+            "$_lm" "$_lh" "$_pre" "$_bin" "$CONF_FILE" "$_log"
+        return 0
+    fi
+    # cron 没有"每 N 天"字段：还是每天到点触发，先看标记文件，
+    # 距上次运行不到 N 天就跳过。减 1 分钟是给踩点抖动留余量，
+    # 否则第 N 天同一时刻可能因为差几秒被判成"N-1 天"而拖到 N+1 天。
+    _stamp=$(cron_stamp_path)
+    printf '%s %s * * * if [ ! -f %s ] || [ -n "$(find %s -mmin +%s 2>/dev/null)" ]; then touch %s; %ssh %s --conf %s >> %s 2>&1; fi\n' \
+        "$_lm" "$_lh" "$_stamp" "$_stamp" "$((_days * 1440 - 100))" \
+        "$_stamp" "$_pre" "$_bin" "$CONF_FILE" "$_log"
 }
 
 cron_bin_path() {
@@ -401,6 +457,12 @@ cron_install() {
     echo "已添加定时任务："
     echo "  $_line"
     echo "  北京时间 ${CRON_TIME:-04:30} = 本机时间 $(bj_to_local_hm "${CRON_TIME:-04:30}")"
+    _days=$(cron_days_norm)
+    if [ "$_days" -gt 1 ]; then
+        echo "  每 $_days 天跑一次（标记文件 $(cron_stamp_path)，删掉它等于重新计时）"
+    else
+        echo "  每天跑一次"
+    fi
     echo "  脚本本体：$_bin"
     return 0
 }
@@ -419,6 +481,7 @@ cron_remove() {
         else
             printf '' | crontab -
         fi
+        rm -f "$(cron_stamp_path)" 2>/dev/null
         echo "已从 crontab 移除 ip_rotate_check 的定时任务。"
         ;;
     *)
@@ -493,19 +556,22 @@ score_via_jina() {
     while [ "$_i" -lt 3 ]; do
         _txt=$(http_get "$_url" 60 jina)
         if [ -n "$_txt" ]; then
-            # 「IP评分」后 60 字节内出现的 NN / 100（页面里常有 "IP评分 99 99/100"
-            # 这种重复，所以窗口内允许出现数字）；用 awk 避开 busybox sed 的量词差异
+            # 「IP评分」后 80 字节内出现的 NN/100（页面里常有 "IP评分 73 73/100"
+            # 这种重复）。不能用 {n,m} 区间量词：busybox awk 和老 mawk 不认，
+            # 在 OpenWrt / Alpine 上会永远匹配不到，只能 index + substr 硬切。
             _s=$(printf '%s' "$_txt" | tr '\n' ' ' | awk '{
                 rest = $0
-                while (match(rest, /IP评分.{0,60}[0-9]{1,3}[[:space:]]*\/[[:space:]]*100/)) {
-                    s = substr(rest, RSTART, RLENGTH)
-                    if (match(s, /[0-9]{1,3}[[:space:]]*\/[[:space:]]*100/)) {
-                        n = substr(s, RSTART, RLENGTH)
-                        sub(/[^0-9].*/, "", n)
-                        print n
-                        exit
+                while ((p = index(rest, "IP评分")) > 0) {
+                    seg = substr(rest, p, 80)
+                    if (match(seg, /[0-9][0-9]*\/100/)) {
+                        n = substr(seg, RSTART, RLENGTH)
+                        sub(/\/.*/, "", n)
+                        if (n + 0 <= 100) {
+                            print n
+                            exit
+                        }
                     }
-                    rest = substr(rest, RSTART + RLENGTH)
+                    rest = substr(rest, p + length("IP评分"))
                 }
             }' | head -n 1)
             if [ -n "$_s" ]; then
@@ -517,8 +583,13 @@ score_via_jina() {
                 printf '\t未收录\n'
                 return 0
                 ;;
+            *"IP评分"*)
+                _note="无评分字段(有IP评分块)"
+                ;;
+            *)
+                _note="无评分字段(无IP评分块)"
+                ;;
             esac
-            _note="无评分字段"
         else
             _note="请求失败"
         fi
@@ -682,6 +753,9 @@ cache_put() {
 
 # ------------------------- 输出 -------------------------
 print_head() {
+    # 带时间戳：cron 日志里能直接看出这一次是几点被拉起的
+    _tz=$(date +%Z 2>/dev/null | tr -d ' ')
+    printf '# %s%s 开始\n' "$(date '+%Y-%m-%d %H:%M:%S')" "${_tz:+ $_tz}"
     printf '%-16s %3s  %-6s %-7s %-12s %-6s %s\n' "IP" "分" "来源" "ip-api" "proxycheck" "判定" "原因"
 }
 
@@ -695,6 +769,43 @@ print_line() {
     printf '%s%-16s %s  %-6s %-7s %-12s %-6s %s\n' \
         "$_pfx" "$CUR_IP" "$_s" "${SCORE_SRC:--}" "${AP_TAG:--}" "${PC_TAG:--}" \
         "$VERDICT" "$_tail"
+}
+
+# 带单位的容量：512K / 2M / 1073741824，非法值返回 0（=不轮转）
+parse_size() {
+    _v=${1:-}
+    case "$_v" in
+    '' | *[!0-9kKmMgG]*) printf '0\n'; return 0 ;;
+    esac
+    _mul=1
+    case "$_v" in
+    *[kK]) _mul=1024 ;;
+    *[mM]) _mul=1048576 ;;
+    *[gG]) _mul=1073741824 ;;
+    esac
+    case "$_v" in
+    *[kKmMgG]) _v=${_v%?} ;;
+    esac
+    case "$_v" in '' | *[!0-9]*) printf '0\n'; return 0 ;; esac
+    printf '%s\n' "$((_v * _mul))"
+}
+
+# 日志超过上限就只留尾部 1/4，长期定时跑也不会把磁盘写满
+log_rotate() {
+    _f=${1:-}
+    _max=${2:-0}
+    [ -n "$_f" ] && [ -f "$_f" ] || return 0
+    case "$_max" in '' | *[!0-9]*) return 0 ;; esac
+    [ "$_max" -gt 0 ] || return 0
+    _sz=$(wc -c <"$_f" 2>/dev/null) || return 0
+    case "$_sz" in '' | *[!0-9]*) return 0 ;; esac
+    [ "$_sz" -gt "$_max" ] || return 0
+    if tail -c "$((_max / 4))" "$_f" >"$_f.tmp.$$" 2>/dev/null; then
+        mv -f "$_f.tmp.$$" "$_f" 2>/dev/null || rm -f "$_f.tmp.$$" 2>/dev/null
+    else
+        rm -f "$_f.tmp.$$" 2>/dev/null
+    fi
+    return 0
 }
 
 write_log() {
@@ -789,6 +900,7 @@ while [ $# -gt 0 ]; do
     --cron-install) CRON_MODE=install; shift ;;
     --cron-remove) CRON_MODE=remove; shift ;;
     --cron-print) CRON_MODE=print; shift ;;
+    --cron-days | --cron-every) CRON_DAYS=$2; CRON_DAYS_SET=1; shift 2 ;;
     --cron-time) CRON_TIME=$2; shift 2 ;;
     --cron-log) CRON_LOG=$2; shift 2 ;;
     --cron-bin-dir) CRON_BIN_DIR=$2; shift 2 ;;
@@ -802,6 +914,7 @@ while [ $# -gt 0 ]; do
     --no-direct) NO_DIRECT=1; shift ;;
     --wait-change) WAIT_CHANGE=$2; shift 2 ;;
     --log) LOG_FILE=$2; shift 2 ;;
+    --log-max) LOG_MAX=$2; shift 2 ;;
     --cache) CACHE_FILE=$2; shift 2 ;;
     --cache-ttl) CACHE_TTL=$2; shift 2 ;;
     --refresh) REFRESH=1; shift ;;
@@ -819,6 +932,10 @@ done
 # 缓存文件：显式指定 > $HOME 可写 > /tmp
 [ -n "$CACHE_FILE" ] || CACHE_FILE="$(writable_home)/.ip_rotate_cache.tsv"
 case "$CACHE_TTL" in '' | *[!0-9]*) CACHE_TTL=21600 ;; esac
+
+# 本次运行的 jsonl 日志先轮转一把，别无限长
+LOG_MAX=$(parse_size "$LOG_MAX")
+[ -n "$LOG_FILE" ] && log_rotate "$LOG_FILE" "$LOG_MAX"
 
 # 无参数且在终端里跑（比如从 tmd 菜单拉起）：问要用的换 IP 接法和阈值
 interactive_setup() {
@@ -882,7 +999,7 @@ interactive_setup() {
         esac
     fi
     if have crontab; then
-        printf "装到 crontab 每天北京时间 %s 自动跑？[y/N]：" "$CRON_TIME"
+        printf "装到 crontab 自动跑（北京时间 %s）？[y/N]：" "$CRON_TIME"
         read _in
         case "$_in" in
         y | Y) CRON_MODE=install ;;
@@ -923,6 +1040,15 @@ if [ -n "$CRON_MODE" ]; then
         if ! have crontab; then
             echo "系统里没有 crontab，装不了定时任务（OpenWrt 需 opkg install cron）" >&2
             exit 2
+        fi
+        # 没给 --cron-days 又在终端里跑：手动输入间隔天数，回车=每天
+        if [ "$CRON_DAYS_SET" = 0 ] && [ -t 0 ]; then
+            printf "每几天跑一次？回车=每天 [%s]：" "$(cron_days_norm)"
+            read _in
+            case "$_in" in
+            '' | *[!0-9]*) : ;;
+            *) CRON_DAYS=$_in ;;
+            esac
         fi
         save_conf "$CONF_FILE" && echo "已保存配置：$CONF_FILE"
         cron_install
@@ -966,6 +1092,13 @@ while [ "$_attempt" -le "$ATTEMPTS" ]; do
     if [ "$VERDICT" = "PASS" ]; then
         echo "=> 可用，停止轮换"
         exit 0
+    fi
+
+    # 拿不到分是"评分源"的问题，不是这个 IP 的问题，"未收录"除外：
+    # 继续换只会把商家的换 IP 次数全烧光，还是查不到，直接停
+    if [ "$VERDICT" = "UNKNOWN" ] && [ "$SCORE_NOTE" != "未收录" ]; then
+        echo "=> 评分源异常（${SCORE_NOTE:-无评分}），换 IP 也拿不到分数，本轮停止" >&2
+        exit 2
     fi
 
     [ "$_attempt" -ge "$ATTEMPTS" ] && break
