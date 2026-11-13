@@ -20,6 +20,7 @@
 #   * 任一源报 proxy/tor/vpn  -> 直接 ROTATE（这才是硬伤）
 #   * 只报 hosting 不算硬伤   -> 机房 IP 本来就 hosting，看分数
 #   * 分数 >= pass-line(80)   -> PASS；未达 -> ROTATE
+#   * --force-rotate          -> 先无条件换一次，再看新 IP（每 N 天必换）
 #   * 退出码：0=可用 1=本轮都不合格 2=查询失败
 #
 # 两层缓存，都会影响"分数新鲜度"：
@@ -73,6 +74,7 @@ DEEP=0
 NO_PROXYCHECK=0
 NO_DIRECT=0
 WAIT_CHANGE=60
+FORCE_ROTATE=0   # 1 = 到点先无条件换一次 IP，再看新 IP 分数
 LOG_FILE=""
 LOG_MAX=1048576  # 日志上限（字节），超过只留尾部 1/4；0=不限
 DRY_RUN=0
@@ -137,6 +139,7 @@ VPS 换 IP 后的自动体检：换 IP -> 查分 + 代理标记 -> 不合格继�
   --no-proxycheck    完全不查 proxycheck
   --no-direct        跳过 /ipscore 直连，直接走 jina 渲染
   --wait-change N    换 IP 后等新 IP 生效的最长秒数，默认 60
+  --force-rotate     到点先无条件换一次 IP，再体检新 IP（每 N 天必换用）
   --log FILE         每次体检结果 + 换 IP 事件追加成 jsonl
   --log-max SIZE     日志轮转上限，默认 1M（超了只留尾部 1/4，0=不限）
   --cache FILE       缓存文件，默认 ~/.ip_rotate_cache.tsv
@@ -315,6 +318,7 @@ save_conf() {
         [ -n "$ROTATE_TOKEN" ] && printf 'ROTATE_TOKEN=%s\n' "$(conf_quote "$ROTATE_TOKEN")"
         [ -n "$ROTATE_DATA" ] && printf 'ROTATE_DATA=%s\n' "$(conf_quote "$ROTATE_DATA")"
         [ -n "$ROTATE_CMD" ] && printf 'ROTATE_CMD=%s\n' "$(conf_quote "$ROTATE_CMD")"
+        printf 'FORCE_ROTATE=%s\n' "$FORCE_ROTATE"
         printf 'ATTEMPTS=%s\n' "$ATTEMPTS"
         printf 'PASS_LINE=%s\n' "$PASS_LINE"
         printf 'HARD_LINE=%s\n' "$HARD_LINE"
@@ -916,6 +920,7 @@ while [ $# -gt 0 ]; do
     --no-proxycheck) NO_PROXYCHECK=1; shift ;;
     --no-direct) NO_DIRECT=1; shift ;;
     --wait-change) WAIT_CHANGE=$2; shift 2 ;;
+    --force-rotate) FORCE_ROTATE=1; shift ;;
     --log) LOG_FILE=$2; shift 2 ;;
     --log-max) LOG_MAX=$2; shift 2 ;;
     --cache) CACHE_FILE=$2; shift 2 ;;
@@ -939,6 +944,12 @@ case "$CACHE_TTL" in '' | *[!0-9]*) CACHE_TTL=21600 ;; esac
 # 本次运行的 jsonl 日志先轮转一把，别无限长
 LOG_MAX=$(parse_size "$LOG_MAX")
 [ -n "$LOG_FILE" ] && log_rotate "$LOG_FILE" "$LOG_MAX"
+
+# --force-rotate 必须有换 IP 的方式，否则和普通体检没区别
+if [ "$FORCE_ROTATE" = 1 ] && ! have_rotate; then
+    echo "--force-rotate 需要配合 --rotate-url 或 --rotate-cmd，当前没有换 IP 方式，已忽略" >&2
+    FORCE_ROTATE=0
+fi
 
 # 无参数且在终端里跑（比如从 tmd 菜单拉起）：问要用的换 IP 接法和阈值
 interactive_setup() {
@@ -993,6 +1004,14 @@ interactive_setup() {
     n | N) DEEP=0 ;;
     esac
     if have_rotate; then
+        _f=N
+        [ "$FORCE_ROTATE" = 1 ] && _f=Y
+        printf "到点先无条件换一次 IP（不看当前分数）？[%s]：" "$_f"
+        read _in
+        case "$_in" in
+        y | Y) FORCE_ROTATE=1 ;;
+        n | N) FORCE_ROTATE=0 ;;
+        esac
         [ -n "$CONF_FILE" ] || CONF_FILE="$(writable_home)/.ip_rotate.conf"
         printf "保存到 %s 下次直接复用？[Y/n]：" "$CONF_FILE"
         read _in
@@ -1077,6 +1096,7 @@ fi
 _best_ip=""
 _best_score="-1"
 _attempt=1
+_force_left=$FORCE_ROTATE
 while [ "$_attempt" -le "$ATTEMPTS" ]; do
     ip=$(current_ip)
     if [ -z "$ip" ]; then
@@ -1086,20 +1106,26 @@ while [ "$_attempt" -le "$ATTEMPTS" ]; do
 
     check_one "$ip" 1 "[$_attempt/$ATTEMPTS] "
 
-    _cur=${SCORE:--1}
-    if [ "$_cur" -gt "$_best_score" ]; then
-        _best_score=$_cur
-        _best_ip=$ip
+    # 强制换掉的那一轮分数不算"最好"：这个 IP 马上就不要了
+    if [ "$_force_left" = 0 ]; then
+        _cur=${SCORE:--1}
+        if [ "$_cur" -gt "$_best_score" ]; then
+            _best_score=$_cur
+            _best_ip=$ip
+        fi
     fi
 
-    if [ "$VERDICT" = "PASS" ]; then
+    if [ "$VERDICT" = "PASS" ] && [ "$_force_left" = 0 ]; then
         echo "=> 可用，停止轮换"
         exit 0
+    fi
+    if [ "$VERDICT" = "PASS" ]; then
+        echo "        --force-rotate：当前 IP 合格也照换" >&2
     fi
 
     # 拿不到分是"评分源"的问题，不是这个 IP 的问题，"未收录"除外：
     # 继续换只会把商家的换 IP 次数全烧光，还是查不到，直接停
-    if [ "$VERDICT" = "UNKNOWN" ] && [ "$SCORE_NOTE" != "未收录" ]; then
+    if [ "$VERDICT" = "UNKNOWN" ] && [ "$SCORE_NOTE" != "未收录" ] && [ "$_force_left" = 0 ]; then
         echo "=> 评分源异常（${SCORE_NOTE:-无评分}），换 IP 也拿不到分数，本轮停止" >&2
         exit 2
     fi
@@ -1117,6 +1143,8 @@ while [ "$_attempt" -le "$ATTEMPTS" ]; do
         break
     fi
 
+    [ "$_force_left" = 1 ] && echo "        --force-rotate：不看分数，直接换" >&2
+
     # 记录换之前的出口 IP：接口调用前现取一次，避免体检那十几秒里出口自己漂移
     _pre_ip=$(current_ip)
     [ -n "$_pre_ip" ] || _pre_ip=$ip
@@ -1129,6 +1157,8 @@ while [ "$_attempt" -le "$ATTEMPTS" ]; do
         sleep 3
         continue
     fi
+    # 换成功了才算完成"无条件换一次"，失败的话下一轮继续强制换
+    _force_left=0
 
     # 判断"换完了"只看一件事：出口 IP 变了没有（不看接口返回什么）
     _old_ip=$_pre_ip
