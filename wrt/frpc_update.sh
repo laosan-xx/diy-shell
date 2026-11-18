@@ -16,7 +16,7 @@
 # 用法：
 #   sh update_frpc_openwrt.sh                 # 升级到最新版
 #   sh update_frpc_openwrt.sh --version 1.2.3 # 升级到指定版本
-#   sh update_frpc_openwrt.sh --mirror https://gh.2026178.xyz
+#   sh update_frpc_openwrt.sh --mirror https://ghproxy.net
 #   sh update_frpc_openwrt.sh --bin /usr/bin/frpc --no-restart
 #   sh update_frpc_openwrt.sh --dry-run       # 只下载解压校验，不替换
 #   sh update_frpc_openwrt.sh --no-follow     # 只转后台就返回，适合 cron
@@ -40,7 +40,7 @@ REPO_NAME="my-frp"
 # ---- 可调参数（命令行可覆盖）---------------------------------------------
 TARGET_VERSION=""          # 空 = 最新
 FRPC_BIN=""                # 空 = 自动探测
-MIRROR="https://gh.2026178.xyz"                  # 空 = 直连 github；或设置如 https://gh.2026178.xyz
+MIRROR=""                  # 空 = 直连 GitHub 官方地址；或设置如 https://ghproxy.net
 NO_RESTART=0
 DRY_RUN=0
 TEST_ROLLBACK=0           # 1 = 替换+重启后强制模拟“版本不匹配”，用来演练回滚

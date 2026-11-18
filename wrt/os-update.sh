@@ -21,10 +21,10 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-DOWNLOAD_PROXY="${DOWNLOAD_PROXY:-https://gh.2026178.xyz}"
-QUALCOMMAX_REPO="https://gh.2026178.xyz/api/repos/laosan-xx/OpenWRT-CI-VIKINGYFY"
+DOWNLOAD_PROXY="${DOWNLOAD_PROXY:-}"
+QUALCOMMAX_REPO="https://api.github.com/repos/laosan-xx/OpenWRT-CI-VIKINGYFY"
 IPQ60_REPO="$QUALCOMMAX_REPO"
-MEDIATEK_REPO="https://gh.2026178.xyz/api/repos/laosan-xx/CloseWRT-CI"
+MEDIATEK_REPO="https://api.github.com/repos/laosan-xx/CloseWRT-CI"
 FILOGIC_REPO="$MEDIATEK_REPO"
 
 log()  { echo "[sysupdate] $*"; }
@@ -150,9 +150,9 @@ BEGIN { RS="\"browser_download_url\""; cur_branch="default"; }
     if (index(ln, "rootfs") > 0) next
     # 4) 用 .bin 扩展名过滤掉 manifest/txt 等非固件文件 (替代原 size>30MB 判断)
     if (index(ln, ".bin") == 0) next
-    # 5) 重写下载地址到代理, 输出
+    # 5) 仅在配置了镜像时重写下载地址, 输出
     dl = url
-    sub(/^https:\/\/github.com\//, dp "/", dl)
+    if (dp != "") sub(/^https:\/\/github.com\//, dp "/", dl)
     print cur_branch, name, dl
 }
 ' | sort -ru > "$CAND"

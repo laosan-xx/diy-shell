@@ -11,8 +11,8 @@ TMP_SCRIPT="/tmp/openclash-menu-action.sh"
 NONINTERACTIVE_ACTION=""
 
 # --------------------- 下载加速配置 ---------------------
-# GitHub 镜像（留空 = 直连）。可用: https://gh.2026178.xyz / https://ghproxy.net / https://gh-proxy.com
-GITHUB_MIRROR="${GITHUB_MIRROR-https://gh.2026178.xyz}"
+# GitHub 镜像（留空 = 直连官方地址）。可自行指定，例如 https://ghproxy.net
+GITHUB_MIRROR="${GITHUB_MIRROR:-}"
 # Gitee 镜像源（上游推荐的国内入口）
 GITEE_BASE_URL="https://gitee.com/naiyou88/openclash-auto-installer/raw/main"
 # HTTP/HTTPS 代理，会 export 给子脚本，可加速 GitHub Release / ipk 内核下载
@@ -222,7 +222,7 @@ usage() {
                        代理会同时透传给子脚本，可加速 Release / ipk 下载
 
 环境变量:
-  GITHUB_MIRROR        默认 https://gh.2026178.xyz，设为空表示直连
+  GITHUB_MIRROR        默认留空（直连 GitHub 官方地址），可指定其他镜像
   PROXY_URL / HTTPS_PROXY   下载代理
   OPENCLASH_AUTO_BASE_URL   自定义脚本源（优先级最高）
 
@@ -642,12 +642,16 @@ run_accel_menu() {
                 auto_pick_source
                 ;;
             2)
-                if [ -z "$GITHUB_MIRROR" ]; then
-                    GITHUB_MIRROR="https://gh.2026178.xyz"
+                printf '请输入 GitHub 镜像地址: ' >/dev/tty
+                read_from_tty _mirror_in
+                if [ -n "$_mirror_in" ]; then
+                    GITHUB_MIRROR="$_mirror_in"
+                    BASE_URL="$DEFAULT_BASE_URL"
+                    RESOLVED_BASE_URL=""
+                    log "已启用 GitHub 镜像: $GITHUB_MIRROR"
+                else
+                    log "未输入镜像地址，保持当前设置"
                 fi
-                BASE_URL="$DEFAULT_BASE_URL"
-                RESOLVED_BASE_URL=""
-                log "已启用 GitHub 镜像: $GITHUB_MIRROR"
                 ;;
             3)
                 GITHUB_MIRROR=""

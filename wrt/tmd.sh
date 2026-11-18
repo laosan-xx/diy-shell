@@ -24,11 +24,10 @@ REPO_OWNER="laosan-xx"
 REPO_NAME="diy-shell"
 REPO_BRANCH="main"
 REPO_DIR="wrt"
-PROXY="https://gh.2026178.xyz"
-API_URL="${PROXY}/api/repos/${REPO_OWNER}/${REPO_NAME}/contents/${REPO_DIR}?ref=${REPO_BRANCH}"
+API_URL="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/contents/${REPO_DIR}?ref=${REPO_BRANCH}"
 # 单文件 Contents API：直接拿到某个文件条目的 sha，比拉整个目录更精准、更省流量
-FILE_API_URL="${PROXY}/api/repos/${REPO_OWNER}/${REPO_NAME}/contents/${REPO_DIR}"
-RAW_BASE="${PROXY}/raw/${REPO_OWNER}/${REPO_NAME}/${REPO_BRANCH}/${REPO_DIR}"
+FILE_API_URL="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/contents/${REPO_DIR}"
+RAW_BASE="https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${REPO_BRANCH}/${REPO_DIR}"
 
 # 自身在系统中的安装路径，以及目标仓库中的本体地址（用于自更新）
 SELF="/usr/bin/tmd"
@@ -56,7 +55,7 @@ else
     exit 1
 fi
 
-# 代理和 GitHub 都会给 raw / API 回 5~60 秒缓存，刚 push 完就抓很容易拿到上一版。
+# GitHub 会给 raw / API 回 5~60 秒缓存，刚 push 完就抓很容易拿到上一版。
 # 给 URL 加个时间戳，保证每次都是唯一的 cache key。
 bust_url() {
     case "$1" in
@@ -305,84 +304,12 @@ do_update() {
     return 0
 }
 
-# 将 host 解析写入 OpenWRT 的 /etc/hosts
-# 已存在该 host 的旧条目则删除后重写，否则追加
-set_openwrt_host() {
-    local host="$1" ip="$2"
-    local hosts="/etc/hosts"
-    if [ ! -f "$hosts" ]; then
-        echo "错误：找不到 $hosts" >&2
-        return 1
-    fi
-    if [ ! -w "$hosts" ]; then
-        echo "错误：无权限写入 $hosts（请使用 root 运行）。" >&2
-        return 1
-    fi
-    # 转义 host 中的正则元字符，避免 sed 误匹配
-    local esc_host=$(printf '%s' "$host" | sed 's/[][\.*^$/]/\\&/g')
-    # 删除所有以该 host 结尾的旧条目
-    sed -i "/[[:space:]]${esc_host}\$/d" "$hosts"
-    # 追加新条目（IP<TAB>host）
-    printf '%s\t%s\n' "$ip" "$host" >> "$hosts"
-    echo "已写入 hosts: ${ip} ${host}"
-    return 0
-}
-
-# 获取并设置 gh.2026178.xyz 的 hosts 解析
-# 数据源：https://ip.164746.xyz/ipTop.html
-# 返回形如 " 104.16.204.6,104.18.103.125 "，取第一个 IP 写入 /etc/hosts
-do_sethost() {
-    local host="gh.2026178.xyz"
-    local src="https://ip.164746.xyz/ipTop.html"
-    echo "正在获取 ${host} 的可用 IP（来源: ${src}）..."
-    local raw=$($FETCH "$src" 2>/dev/null)
-    if [ -z "$raw" ]; then
-        echo "错误：无法获取 IP 列表: $src" >&2
-        return 1
-    fi
-    # 拆分逗号、去空格/制表/回车，提取首个合法 IPv4
-    local ip=$(echo "$raw" | tr ',' '\n' | tr -d ' \t\r' \
-        | grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | head -n1)
-    if [ -z "$ip" ]; then
-        echo "错误：未从返回中解析到有效 IP，原始返回: $raw" >&2
-        return 1
-    fi
-    echo "解析到首个 IP: $ip"
-    set_openwrt_host "$host" "$ip"
-    return $?
-}
-
-# 恢复：从 /etc/hosts 中删除 gh.2026178.xyz 的条目（撤销 sethost 的效果）
-do_restorehost() {
-    local host="gh.2026178.xyz"
-    local hosts="/etc/hosts"
-    if [ ! -f "$hosts" ]; then
-        echo "错误：找不到 $hosts" >&2
-        return 1
-    fi
-    if [ ! -w "$hosts" ]; then
-        echo "错误：无权限写入 $hosts（请使用 root 运行）。" >&2
-        return 1
-    fi
-    local esc_host=$(printf '%s' "$host" | sed 's/[][\.*^$/]/\\&/g')
-    local before=$(grep -c "[[:space:]]${esc_host}\$" "$hosts" 2>/dev/null || true)
-    sed -i "/[[:space:]]${esc_host}\$/d" "$hosts"
-    if [ "$before" -gt 0 ]; then
-        echo "已清除 ${host} 的 hosts 条目（共 ${before} 条）。"
-    else
-        echo "${host} 在 ${hosts} 中不存在条目，无需恢复。"
-    fi
-    return 0
-}
-
-# 子命令处理：check / update / sethost / restore / refresh / run
+# 子命令处理：check / update / refresh / run
 # 注意：不能靠 "$0" = "$SELF" 判断 —— 通过 PATH 调用时 $0 是 "tmd" 而不是
 # "/usr/bin/tmd"，那样 tmd update / tmd refresh 会被静默忽略、直接掉进菜单。
 case "$1" in
     check)    do_check;    exit $? ;;
     update)   do_update;   exit $? ;;
-    sethost)  do_sethost;  exit $? ;;
-    restore)  do_restorehost; exit $? ;;
     refresh)
         if fetch_index; then
             echo "脚本列表已刷新（$(load_names | wc -l | tr -d ' ') 个脚本），脚本缓存已清空，下次运行会重新下载。"
@@ -441,8 +368,6 @@ done
 if [ "$named" -eq 0 ]; then
     echo "（中文名未获取：确认 tmd 本体已是最新，并执行 tmd refresh 重试）"
 fi
-echo "   h) 设置 gh.2026178.xyz 的 hosts"
-echo "   r) 恢复 gh.2026178.xyz（清除 hosts 条目）"
 echo "   q) 退出"
 echo ""
 printf "请选择要运行的脚本编号: "
@@ -450,8 +375,6 @@ read choice
 
 case "$choice" in
     q|Q) echo "已取消。"; exit 0 ;;
-    h|H) do_sethost; exit $? ;;
-    r|R) do_restorehost; exit $? ;;
     '' ) echo "未选择，退出。"; exit 0 ;;
 esac
 

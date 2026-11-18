@@ -3,24 +3,12 @@ import { ref, onMounted, watch } from 'vue'
 import { useRoute, RouterLink } from 'vue-router'
 import ManualViewer from '../components/ManualViewer.vue'
 import VideoPlayer from '../components/VideoPlayer.vue'
-import { enrichTool, getReadme, withProxy } from '../github.js'
+import { enrichTool, getReadme } from '../github.js'
 
 const route = useRoute()
 const tool = ref(null)
 const manualSource = ref('')
 const imgError = ref(false)
-
-// 下载代理：默认优先加速；用户偏好记忆在 localStorage
-const proxyDomain = ref('')
-const useProxy = ref(localStorage.getItem('dl_proxy') !== 'off')
-
-function setProxy(v) {
-  useProxy.value = v
-  localStorage.setItem('dl_proxy', v ? 'on' : 'off')
-}
-function proxied(url) {
-  return useProxy.value && proxyDomain.value ? withProxy(url, proxyDomain.value) : url
-}
 
 function fmtSize(n) {
   if (n == null) return ''
@@ -40,7 +28,6 @@ async function load() {
   try {
     const res = await fetch(`${import.meta.env.BASE_URL}data/tools.json`)
     const data = await res.json()
-    proxyDomain.value = data.proxy?.domain || ''
     const base = (data.tools || []).find((t) => t.id === route.params.id)
     if (!base) {
       tool.value = null
@@ -104,33 +91,15 @@ watch(() => route.params.id, load)
       </div>
     </header>
 
-    <!-- 下载：自动来自 GitHub Release assets，可切换官方/加速地址 -->
+    <!-- 下载：来自 GitHub Release 官方地址 -->
     <section>
       <h2 class="text-lg font-semibold mb-3 flex items-center gap-2">📥 下载</h2>
-
-      <div v-if="proxyDomain" class="flex items-center gap-2 mb-4 text-sm">
-        <span class="text-slate-400">下载源：</span>
-        <button
-          @click="setProxy(false)"
-          :class="!useProxy
-            ? 'bg-emerald-500/20 border-emerald-500 text-emerald-300'
-            : 'border-slate-700 text-slate-300 hover:border-slate-500'"
-          class="px-3 py-1.5 rounded-lg border transition"
-        >官方原地址</button>
-        <button
-          @click="setProxy(true)"
-          :class="useProxy
-            ? 'bg-emerald-500/20 border-emerald-500 text-emerald-300'
-            : 'border-slate-700 text-slate-300 hover:border-slate-500'"
-          class="px-3 py-1.5 rounded-lg border transition"
-        >加速 ({{ proxyDomain }})</button>
-      </div>
 
       <div v-if="tool.release && tool.release.assets.length" class="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
         <a
           v-for="a in tool.release.assets"
           :key="a.url"
-          :href="proxied(a.url)"
+          :href="a.url"
           target="_blank"
           rel="noopener noreferrer"
           class="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-medium transition"
@@ -142,7 +111,7 @@ watch(() => route.params.id, load)
         暂未获取到 Release，请前往仓库下载。
       </p>
       <a
-        :href="proxied((tool.htmlUrl || '#') + '/releases')"
+        :href="(tool.htmlUrl || '#') + '/releases'"
         target="_blank"
         rel="noopener noreferrer"
         class="inline-block mt-2 px-4 py-2 rounded-lg border border-slate-700 hover:border-emerald-500 text-sm transition"

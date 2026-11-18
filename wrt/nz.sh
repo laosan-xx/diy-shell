@@ -12,7 +12,7 @@
 #     4. 安装 procd 原生 init 脚本，开机自启 + 崩溃自动重启
 #
 # 对应官方默认安装命令中的参数：
-#   NZ_SERVER=nz-cdn.2026178.xyz:443
+#   NZ_SERVER=面板域名:443
 #   NZ_TLS=true
 #   NZ_CLIENT_SECRET=byRKoDjUCXXYD8Cs3gSbXOL6C7iKr3iR
 #
@@ -51,7 +51,7 @@ NZ_REPORT_DELAY="1"
 
 # GitHub 下载镜像 (国内加速，留空则仅走 GitHub 直连)
 # 代理格式: 镜像域名 + github 路径 (不含 https://github.com/)
-MIRROR="https://gh.2026178.xyz/"
+MIRROR=""
 
 # --------------------- 路径 ---------------------
 NZ_BASE_PATH="/opt/nezha"

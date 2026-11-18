@@ -41,7 +41,7 @@ MODE="ipv4"
 
 TG_BOT_TOKEN="7622740934:AAETTKoZ_E0EYxUbINpEdzMi__i09uqyqsA"         # Telegram Bot Token
 TG_CHAT_ID="812793390"           # Telegram Chat ID
-TG_API="tg.2026178.xyz"  # API 地址，国内可填反代
+TG_API="api.telegram.org"  # Telegram 官方 API 地址
 
 # 推送 IP 数量
 TOP_N=5
@@ -51,8 +51,8 @@ CFST="cdnspeedtest"
 RESULT_FILE="/tmp/cloudflarespeedtestresult.txt"
 IPV4_TXT="/tmp/ip.txt"
 IPV6_TXT="/tmp/ipv6.txt"
-IP_URL_V4="https://gh.2026178.xyz/raw/XIU2/CloudflareSpeedTest/master/ip.txt"
-IP_URL_V6="https://gh.2026178.xyz/raw/XIU2/CloudflareSpeedTest/master/ipv6.txt"
+IP_URL_V4="https://raw.githubusercontent.com/XIU2/CloudflareSpeedTest/master/ip.txt"
+IP_URL_V6="https://raw.githubusercontent.com/XIU2/CloudflareSpeedTest/master/ipv6.txt"
 CRON_FILE="/etc/crontabs/root"
 
 # --------------------- 测试参数 (正式 start/cron 使用) ---------------------
