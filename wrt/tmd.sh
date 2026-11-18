@@ -43,15 +43,15 @@ DESC_TMP="${CACHE_DIR}/desc"   # 本次刷新抓到的自描述暂存目录
 TAB=$(printf '\t')             # 索引是 name<TAB>sha<TAB>desc 三列
 CACHE_TTL=600   # 列表缓存有效期（秒），默认 10 分钟
 
-# 选择可用的下载器
-if command -v uclient-fetch >/dev/null 2>&1; then
-    FETCH="uclient-fetch -q -O -"
-elif command -v curl >/dev/null 2>&1; then
-    FETCH="curl -fsSL"
+# 选择可用的下载器（curl 优先，uclient-fetch 对部分 GitHub IP 会连接超时）
+if command -v curl >/dev/null 2>&1; then
+    FETCH="curl -fsSL --connect-timeout 10 --retry 1"
 elif command -v wget >/dev/null 2>&1; then
     FETCH="wget -q -O -"
+elif command -v uclient-fetch >/dev/null 2>&1; then
+    FETCH="uclient-fetch -q -O - -T 30"
 else
-    echo "错误：未找到 uclient-fetch / curl / wget，无法下载。" >&2
+    echo "错误：未找到 curl / wget / uclient-fetch，无法下载。" >&2
     exit 1
 fi
 
@@ -211,7 +211,7 @@ desc_of() {
 }
 
 # 校验下载结果是否可以安全执行
-# uclient-fetch 超时、代理断流、代理返回错误页，都会留下一个非空但残缺的文件。
+# 下载器超时、代理断流、代理返回错误页，都会留下一个非空但残缺的文件。
 # 只看 -s 会把半截脚本当成完整脚本缓存起来并执行，报
 #   syntax error: unterminated quoted string
 # 更麻烦的是坏文件留在缓存里不会失效，重跑多少次都是同一个错。
@@ -285,21 +285,44 @@ do_check() {
 
 # 真正下载并覆盖本体，写回新的 sha
 do_update() {
+    echo "正在检查 TMD 远程版本 ..."
+    local remote_sha
+    remote_sha=$(get_file_sha "tmd.sh")
+    if [ -z "$remote_sha" ]; then
+        echo "错误：无法获取远程版本信息（网络问题或 API 限流），已中止更新。" >&2
+        return 1
+    fi
+
     echo "正在下载最新 TMD 本体 ..."
     TMP_SELF="/tmp/tmd_self.$$"
-    # 同样要校验完整性：半截的本体会把 tmd 自己搞坏，比脚本损坏更麻烦
     if ! $FETCH "$(bust_url "$SELF_REMOTE")" > "$TMP_SELF" 2>/dev/null || ! valid_script "$TMP_SELF"; then
         echo "错误：下载 TMD 本体失败或内容不完整: $SELF_REMOTE" >&2
         rm -f "$TMP_SELF"
         return 1
     fi
-    cp -f "$TMP_SELF" "$SELF" && chmod +x "$SELF"
-    rm -f "$TMP_SELF"
-    # 刷新本地 sha 记录
-    new_sha=$(get_file_sha "tmd.sh")
-    if [ -n "$new_sha" ]; then
-        echo "$new_sha" > "$SELF_SHA"
+    # 防止拿到旧代理缓存的脚本：本体必须请求 GitHub 官方 API / raw
+    if ! grep -q 'https://api.github.com/repos/' "$TMP_SELF" \
+        || ! grep -q 'https://raw.githubusercontent.com/' "$TMP_SELF"; then
+        echo "错误：下载到的本体不是使用 GitHub 官方地址的版本，已中止更新。" >&2
+        rm -f "$TMP_SELF"
+        return 1
     fi
+
+    # 内容未变化：只登记 sha，不覆盖、不误报更新
+    if [ -f "$SELF" ] && cmp -s "$TMP_SELF" "$SELF"; then
+        printf '%s\n' "$remote_sha" > "$SELF_SHA"
+        rm -f "$TMP_SELF"
+        echo "TMD 已是最新版本。"
+        return 0
+    fi
+
+    if ! cp -f "$TMP_SELF" "$SELF" || ! chmod +x "$SELF"; then
+        echo "错误：写入 $SELF 失败。" >&2
+        rm -f "$TMP_SELF"
+        return 1
+    fi
+    rm -f "$TMP_SELF"
+    printf '%s\n' "$remote_sha" > "$SELF_SHA"
     echo "TMD 已更新到最新版本。"
     return 0
 }
