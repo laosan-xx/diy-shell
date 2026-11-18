@@ -90,14 +90,15 @@ fi
 log "步骤 3/5  查询 GitHub 发布固件列表 ..."
 API_URL="${REPO_API}/releases?per_page=20"
 
-if command -v uclient-fetch >/dev/null 2>&1; then
-    FETCH="uclient-fetch -qO -"
+# curl 优先，uclient-fetch 对部分 GitHub IP 会连接超时
+if command -v curl >/dev/null 2>&1; then
+    FETCH="curl -fsSL --connect-timeout 10 --retry 1"
 elif command -v wget >/dev/null 2>&1; then
     FETCH="wget -qO -"
-elif command -v curl >/dev/null 2>&1; then
-    FETCH="curl -fsSL"
+elif command -v uclient-fetch >/dev/null 2>&1; then
+    FETCH="uclient-fetch -qO - -T 30"
 else
-    err "缺少可用的下载工具 (uclient-fetch/wget/curl)"
+    err "缺少可用的下载工具 (curl/wget/uclient-fetch)"
     exit 1
 fi
 
@@ -233,16 +234,28 @@ DEST="/tmp/$SEL_NAME"
 
 log "  已选择: $SEL_NAME"
 
-# 下载 (带进度显示)
-if command -v uclient-fetch >/dev/null 2>&1; then
-    uclient-fetch -O "$DEST" "$SEL_URL"
-elif command -v wget >/dev/null 2>&1; then
-    wget -O "$DEST" "$SEL_URL"
-elif command -v curl >/dev/null 2>&1; then
-    curl -fL -o "$DEST" "$SEL_URL"
+# 下载 (优先 curl / wget，uclient-fetch 兜底)
+rm -f "$DEST"
+dl_ok=0
+if command -v curl >/dev/null 2>&1; then
+    if curl -fL --retry 2 --connect-timeout 15 -o "$DEST" "$SEL_URL"; then
+        dl_ok=1
+    fi
+fi
+if [ "$dl_ok" -eq 0 ] && command -v wget >/dev/null 2>&1; then
+    rm -f "$DEST"
+    if wget -O "$DEST" "$SEL_URL"; then
+        dl_ok=1
+    fi
+fi
+if [ "$dl_ok" -eq 0 ] && command -v uclient-fetch >/dev/null 2>&1; then
+    rm -f "$DEST"
+    if uclient-fetch -T 60 -O "$DEST" "$SEL_URL"; then
+        dl_ok=1
+    fi
 fi
 
-if [ ! -s "$DEST" ]; then
+if [ "$dl_ok" -eq 0 ] || [ ! -s "$DEST" ]; then
     err "下载失败或文件为空: $DEST"
     rm -f "$DEST" "$CAND" "$BRANCHES" "$FILES"
     exit 1
